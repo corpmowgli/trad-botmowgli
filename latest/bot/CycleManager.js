@@ -450,4 +450,4 @@ export class CycleManager extends EventEmitter {
   }
 }
 
-export default CycleManager;//CycleManager.js
+export default CycleManager;

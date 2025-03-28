@@ -500,4 +500,4 @@ export class DataManager {
   }
 }
 
-export default DataManager;//DataManager.js
+export default DataManager;
