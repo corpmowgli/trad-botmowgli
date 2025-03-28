@@ -5,6 +5,7 @@ import { delay } from '../utils/helpers.js';
 /**
  * Gère les cycles de trading du bot
  * Responsable du timing, de l'orchestration et de l'exécution des cycles
+ * Optimisé pour le traitement parallèle et la gestion efficace des ressources
  */
 export class CycleManager extends EventEmitter {
   /**
@@ -48,7 +49,9 @@ export class CycleManager extends EventEmitter {
       failedCycles: 0,
       lastCycleTime: null,
       avgCycleDuration: 0,
-      totalCycleDuration: 0
+      totalCycleDuration: 0,
+      tokensProcessed: 0,
+      signalsGenerated: 0
     };
 
     // État du circuit breaker
@@ -59,6 +62,14 @@ export class CycleManager extends EventEmitter {
       cooldownUntil: null,
       maxConsecutiveErrors: config.errorHandling?.maxConsecutiveErrors || 3
     };
+    
+    // Cache des prix pour la vérification des positions
+    this.priceCache = new Map();
+    this.priceCacheTime = 0;
+    this.priceCacheTTL = 10000; // 10 secondes
+    
+    // Réglage des limites de concurrence
+    this.concurrencyLimit = config.performance?.tokenConcurrency || 5;
   }
 
   /**
@@ -122,7 +133,7 @@ export class CycleManager extends EventEmitter {
   }
 
   /**
-   * Exécute un cycle de trading
+   * Exécute un cycle de trading avec traitement parallèle optimisé
    * @returns {Promise<boolean>} Succès ou échec du cycle
    */
   async runTradingCycle() {
@@ -145,15 +156,13 @@ export class CycleManager extends EventEmitter {
         return this.completeCycle(cycleStartTime, true);
       }
 
-      // Étape 2: Analyser chaque token pour des signaux de trading
-      for (const token of tokens) {
-        // Si on est en train d'arrêter, ne pas traiter les tokens restants
-        if (this.isStopping) break;
+      // Étape 2: Précharger les données de marché pour les tokens
+      await this.preloadMarketData(tokens);
 
-        await this.processToken(token);
-      }
+      // Étape 3: Analyser les tokens par lots avec limitation de concurrence
+      await this.processTokensBatch(tokens);
 
-      // Étape 3: Vérifier les positions existantes
+      // Étape 4: Vérifier les positions existantes
       await this.checkPositions();
 
       // Marquer le cycle comme réussi
@@ -167,6 +176,65 @@ export class CycleManager extends EventEmitter {
       this.emit('error', new Error(`Cycle error: ${error.message}`));
       
       return this.completeCycle(cycleStartTime, false);
+    }
+  }
+
+  /**
+   * Précharge les données de marché pour un lot de tokens
+   * @private
+   * @param {Array<Object>} tokens - Liste de tokens
+   * @returns {Promise<void>}
+   */
+  async preloadMarketData(tokens) {
+    try {
+      // Obtenir les identifiants de tokens
+      const tokenMints = tokens.map(token => token.token_mint);
+      
+      // Précharger les prix dans le cache du marketData
+      if (tokenMints.length > 0) {
+        await this.marketData.getBatchTokenPrices(tokenMints);
+      }
+    } catch (error) {
+      this.emit('warning', `Error preloading market data: ${error.message}`);
+      // Continue l'exécution même en cas d'erreur de préchargement
+    }
+  }
+
+  /**
+   * Traite un lot de tokens avec limite de concurrence
+   * @private
+   * @param {Array<Object>} tokens - Liste de tokens à analyser
+   * @returns {Promise<void>}
+   */
+  async processTokensBatch(tokens) {
+    const batchSize = this.concurrencyLimit;
+    
+    // Filtrer les tokens qui n'ont pas déjà une position ouverte
+    const openPositions = this.positionManager.getOpenPositions();
+    const openPositionTokens = new Set(openPositions.map(p => p.token));
+    
+    const tokensToProcess = tokens.filter(token => 
+      !openPositionTokens.has(token.token_mint)
+    );
+    
+    // Traiter les tokens par lots pour limiter la concurrence
+    for (let i = 0; i < tokensToProcess.length; i += batchSize) {
+      // Si on est en train d'arrêter, interrompre le traitement
+      if (this.isStopping) break;
+      
+      const batch = tokensToProcess.slice(i, i + batchSize);
+      
+      // Traiter les tokens du lot en parallèle
+      await Promise.all(
+        batch.map(token => this.processToken(token))
+      );
+      
+      this.metrics.tokensProcessed += batch.length;
+      
+      // Petite pause entre les lots pour éviter de surcharger l'API
+      if (i + batchSize < tokensToProcess.length && !this.isStopping) {
+        await delay(200);
+      }
     }
   }
 
@@ -214,8 +282,10 @@ export class CycleManager extends EventEmitter {
       }
 
       // Obtenir les données historiques pour analyse
-      const prices = await this.getHistoricalPrices(token.token_mint);
-      const volumes = await this.getHistoricalVolumes(token.token_mint);
+      const [prices, volumes] = await Promise.all([
+        this.getHistoricalPrices(token.token_mint),
+        this.getHistoricalVolumes(token.token_mint)
+      ]);
       
       if (!prices || prices.length < 20) {
         this.emit('debug', `Insufficient price data for ${token.token_mint}`);
@@ -224,6 +294,10 @@ export class CycleManager extends EventEmitter {
 
       // Analyser avec la stratégie
       const signal = await this.strategy.analyze(token.token_mint, prices, volumes, token);
+      
+      if (signal.type !== 'NONE') {
+        this.metrics.signalsGenerated++;
+      }
 
       // Si on a un signal clair et que le risk manager autorise
       if (signal.type !== 'NONE' && signal.confidence >= this.config.trading.minConfidenceThreshold) {
@@ -236,7 +310,8 @@ export class CycleManager extends EventEmitter {
           const position = await this.positionManager.openPosition(
             token.token_mint,
             currentPrice,
-            positionSize
+            positionSize,
+            signal
           );
 
           if (position) {
@@ -257,8 +332,11 @@ export class CycleManager extends EventEmitter {
    */
   async checkPositions() {
     try {
-      // Récupérer les prix actuels
-      const currentPrices = await this.getCurrentPrices();
+      const positions = this.positionManager.getOpenPositions();
+      if (positions.length === 0) return;
+      
+      // Récupérer les prix actuels (avec cache)
+      const currentPrices = await this.getCachedCurrentPrices();
       
       // Pas de prix, pas de vérification
       if (!currentPrices || currentPrices.size === 0) return;
@@ -286,6 +364,43 @@ export class CycleManager extends EventEmitter {
 
   /**
    * Récupère les prix actuels pour tous les tokens en position ouverte
+   * Utilise un cache pour éviter des appels API redondants
+   * @private
+   * @returns {Promise<Map>} Map des prix actuels
+   */
+  async getCachedCurrentPrices() {
+    try {
+      const now = Date.now();
+      const positions = this.positionManager.getOpenPositions();
+      if (positions.length === 0) return new Map();
+
+      const tokens = positions.map(p => p.token);
+      
+      // Vérifier si le cache est valide
+      if (this.priceCache.size > 0 && (now - this.priceCacheTime) < this.priceCacheTTL) {
+        // Si tous les tokens requis sont dans le cache, retourner le cache
+        const allTokensInCache = tokens.every(token => this.priceCache.has(token));
+        if (allTokensInCache) {
+          return this.priceCache;
+        }
+      }
+      
+      // Sinon, récupérer les données fraîches
+      const priceMap = await this.getCurrentPrices();
+      
+      // Mettre à jour le cache
+      this.priceCache = priceMap;
+      this.priceCacheTime = now;
+      
+      return priceMap;
+    } catch (error) {
+      this.emit('error', new Error(`Error getting cached current prices: ${error.message}`));
+      return new Map();
+    }
+  }
+
+  /**
+   * Récupère les prix actuels pour tous les tokens en position ouverte
    * @private
    * @returns {Promise<Map>} Map des prix actuels
    */
@@ -295,15 +410,18 @@ export class CycleManager extends EventEmitter {
       if (positions.length === 0) return new Map();
 
       const tokens = positions.map(p => p.token);
+      
+      // Utiliser l'appel batch pour l'efficacité
+      const batchPrices = await this.marketData.getBatchTokenPrices(tokens);
       const priceMap = new Map();
-
-      for (const token of tokens) {
-        const price = await this.marketData.getTokenPrice(token);
-        if (price) {
+      
+      // Convertir l'objet en Map
+      if (batchPrices && typeof batchPrices === 'object') {
+        for (const [token, price] of Object.entries(batchPrices)) {
           priceMap.set(token, price);
         }
       }
-
+      
       return priceMap;
     } catch (error) {
       this.emit('error', new Error(`Error getting current prices: ${error.message}`));
@@ -447,6 +565,9 @@ export class CycleManager extends EventEmitter {
       clearInterval(this.cycleInterval);
       this.cycleInterval = null;
     }
+    
+    // Nettoyer les caches
+    this.priceCache.clear();
   }
 }
 
