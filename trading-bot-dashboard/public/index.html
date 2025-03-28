@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Bot Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.css">
+    <link rel="stylesheet" href="css/styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4.6.0/dist/socket.io.min.js"></script>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="#">Trading Bot Dashboard</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav">
+                    <li class="nav-item">
+                        <a class="nav-link active" href="#dashboard">Dashboard</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="#trades">Trades</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="#performance">Performance</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="#simulation">Simulation</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="#settings">Paramètres</a>
+                    </li>
+                </ul>
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item">
+                        <span id="userInfo" class="nav-link text-light me-3"></span>
+                    </li>
+                    <li class="nav-item">
+                        <button id="startBotBtn" class="btn btn-success me-2">Démarrer Bot</button>
+                    </li>
+                    <li class="nav-item">
+                        <button id="stopBotBtn" class="btn btn-danger me-2" disabled>Arrêter Bot</button>
+                    </li>
+                    <!-- Le bouton de déconnexion sera ajouté dynamiquement ici -->
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container-fluid mt-3">
+        <!-- Statut du Bot -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header">
+                        Statut du Bot
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-3">
+                                <div class="status-indicator">
+                                    <div id="botStatus" class="status-circle offline"></div>
+                                    <span id="botStatusText">Hors ligne</span>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="d-flex flex-column">
+                                    <span class="text-muted">Capital</span>
+                                    <h3 id="capitalValue">0.00 USD</h3>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="d-flex flex-column">
+                                    <span class="text-muted">Profit Total</span>
+                                    <h3 id="totalProfitValue">0.00 USD</h3>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="d-flex flex-column">
+                                    <span class="text-muted">Win Rate</span>
+                                    <h3 id="winRateValue">0%</h3>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Graphiques principaux -->
+        <div class="row mb-4">
+            <div class="col-md-8">
+                <div class="card">
+                    <div class="card-header">
+                        Performance journalière
+                    </div>
+                    <div class="card-body">
+                        <canvas id="dailyPerformanceChart" height="250"></canvas>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card">
+                    <div class="card-header">
+                        Répartition des Trades
+                    </div>
+                    <div class="card-body">
+                        <canvas id="tradesDistributionChart" height="250"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Derniers Trades -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span>Derniers Trades</span>
+                        <div>
+                            <button id="refreshTradesBtn" class="btn btn-sm btn-outline-primary">
+                                <i class="fas fa-sync-alt"></i> Rafraîchir
+                            </button>
+                            <div class="btn-group">
+                                <button id="exportTradesBtn" class="btn btn-sm btn-outline-secondary dropdown-toggle" data-bs-toggle="dropdown" aria-expanded="false">
+                                    <i class="fas fa-download"></i> Exporter
+                                </button>
+                                <ul class="dropdown-menu">
+                                    <li><a class="dropdown-item" href="#" id="exportJsonBtn">JSON</a></li>
+                                    <li><a class="dropdown-item" href="#" id="exportCsvBtn">CSV</a></li>
+                                    <li><hr class="dropdown-divider"></li>
+                                    <li><a class="dropdown-item" href="#" id="exportCompressedBtn">Compressé (GZ)</a></li>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="table-responsive">
+                            <table class="table table-striped table-hover">
+                                <thead>
+                                    <tr>
+                                        <th>Date</th>
+                                        <th>Token</th>
+                                        <th>Type</th>
+                                        <th>Prix d'entrée</th>
+                                        <th>Prix de sortie</th>
+                                        <th>Montant</th>
+                                        <th>Profit</th>
+                                        <th>% Profit</th>
+                                        <th>Durée</th>
+                                        <th>Signal</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="tradesTableBody">
+                                    <!-- Les trades seront chargés ici dynamiquement -->
+                                    <tr>
+                                        <td colspan="10" class="text-center">Chargement des données...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        <div class="d-flex justify-content-between align-items-center mt-3">
+                            <div class="pagination-info">
+                                <span id="totalTradesCount">0</span> trades au total
+                            </div>
+                            <nav aria-label="Navigation des pages">
+                                <ul class="pagination" id="tradesPagination">
+                                    <!-- Pagination générée dynamiquement -->
+                                </ul>
+                            </nav>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Métriques de Performance -->
+        <div class="row mb-4">
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header">
+                        Métriques de Performance
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <ul class="list-group">
+                                    <li class="list-group-item d-flex justify-content-between">
+                                        <span>Trades Total</span>
+                                        <span id="totalTradesValue" class="badge bg-primary">0</span>
+                                    </li>
+                                    <li class="list-group-item d-flex justify-content-between">
+                                        <span>Trades Gagnants</span>
+                                        <span id="winningTradesValue" class="badge bg-success">0</span>
+                                    </li>
+                                    <li class="list-group-item d-flex justify-content-between">
+                                        <span>Trades Perdants</span>
+                                        <span id="losingTradesValue" class="badge bg-danger">0</span>
+                                    </li>
+                                    <li class="list-group-item d-flex justify-content-between">
+                                        <span>Win Rate</span>
+                                        <span id="winRateMetricValue">0%</span>
+                                    </li>
+                                </ul>
+                            </div>
+                            <div class="col-md-6">
+                                <ul class="list-group">
+                                    <li class="list-group-item d-flex justify-content-between">
+                                        <span>Profit Moyen</span>
+                                        <span id="avgProfitValue">0.00 USD</span>
+                                    </li>
+                                    <li class="list-group-item d-flex justify-content-between">
+                                        <span>Perte Moyenne</span>
+                                        <span id="avgLossValue">0.00 USD</span>
+                                    </li>
+                                    <li class="list-group-item d-flex justify-content-between">
+                                        <span>Plus Grand Gain</span>
+                                        <span id="biggestWinValue">0.00 USD</span>
+                                    </li>
+                                    <li class="list-group-item d-flex justify-content-between">
+                                        <span>Plus Grande Perte</span>
+                                        <span id="biggestLossValue">0.00 USD</span>
+                                    </li>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header">
+                        Évolution du Capital
+                    </div>
+                    <div class="card-body">
+                        <canvas id="capitalEvolutionChart" height="250"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Simulation -->
+        <div class="row mb-4" id="simulationSection" style="display: none;">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header">
+                        Backtest / Simulation
+                    </div>
+                    <div class="card-body">
+                        <div class="row mb-3">
+                            <div class="col-md-3">
+                                <label for="startDateInput" class="form-label">Date de début</label>
+                                <input type="date" class="form-control" id="startDateInput">
+                            </div>
+                            <div class="col-md-3">
+                                <label for="endDateInput" class="form-label">Date de fin</label>
+                                <input type="date" class="form-control" id="endDateInput">
+                            </div>
+                            <div class="col-md-2 d-flex align-items-end">
+                                <button id="runSimulationBtn" class="btn btn-primary w-100">Lancer la Simulation</button>
+                            </div>
+                        </div>
+                        <div id="simulationResults" style="display: none;">
+                            <div class="alert alert-info" role="alert">
+                                Résultats de la simulation
+                            </div>
+                            <div class="row">
+                                <div class="col-md-6">
+                                    <h5>Métriques de Simulation</h5>
+                                    <ul class="list-group">
+                                        <li class="list-group-item d-flex justify-content-between">
+                                            <span>Trades Total</span>
+                                            <span id="simTotalTradesValue" class="badge bg-primary">0</span>
+                                        </li>
+                                        <li class="list-group-item d-flex justify-content-between">
+                                            <span>Trades Gagnants</span>
+                                            <span id="simWinningTradesValue" class="badge bg-success">0</span>
+                                        </li>
+                                        <li class="list-group-item d-flex justify-content-between">
+                                            <span>Trades Perdants</span>
+                                            <span id="simLosingTradesValue" class="badge bg-danger">0</span>
+                                        </li>
+                                        <li class="list-group-item d-flex justify-content-between">
+                                            <span>Win Rate</span>
+                                            <span id="simWinRateValue">0%</span>
+                                        </li>
+                                        <li class="list-group-item d-flex justify-content-between">
+                                            <span>Profit Total</span>
+                                            <span id="simTotalProfitValue">0.00 USD</span>
+                                        </li>
+                                        <li class="list-group-item d-flex justify-content-between">
+                                            <span>Max Drawdown</span>
+                                            <span id="simMaxDrawdownValue">0%</span>
+                                        </li>
+                                    </ul>
+                                </div>
+                                <div class="col-md-6">
+                                    <canvas id="simulationProfitChart" height="250"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal pour les erreurs d'authentification -->
+    <div class="modal fade" id="authErrorModal" tabindex="-1" aria-labelledby="authErrorModalLabel" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="authErrorModalLabel">Erreur d'authentification</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Fermer"></button>
+                </div>
+                <div class="modal-body">
+                    Votre session a expiré ou vous n'êtes pas authentifié.
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-primary" id="redirectLoginBtn">Se connecter</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="bg-light text-center text-lg-start mt-4">
+        <div class="text-center p-3" style="background-color: rgba(0, 0, 0, 0.05);">
+            <span>Trading Bot Dashboard</span>
+            <span id="currentDateTime" class="ms-2">--</span>
+        </div>
+    </footer>
+
+    <!-- Chargement des scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://kit.fontawesome.com/a076d05399.js" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script>
+    <script src="js/app.js"></script>
+    <script src="js/charts.js"></script>
+    
+    <script>
+        // Gestion de la modal d'authentification
+        document.addEventListener('DOMContentLoaded', () => {
+            const authErrorModal = new bootstrap.Modal(document.getElementById('authErrorModal'));
+            const redirectLoginBtn = document.getElementById('redirectLoginBtn');
+            
+            // Gestion du clic sur le bouton de redirection de login
+            redirectLoginBtn.addEventListener('click', () => {
+                window.location.href = '/login';
+            });
+            
+            // Intercepter les erreurs d'authentification
+            const originalFetch = window.fetch;
+            window.fetch = async function(...args) {
+                const response = await originalFetch(...args);
+                
+                if (response.status === 401 || response.status === 403) {
+                    // Montrer la modal d'erreur d'authentification
+                    authErrorModal.show();
+                }
+                
+                return response;
+            };
+            
+            // Export formats
+            document.getElementById('exportJsonBtn').addEventListener('click', () => {
+                window.open('/api/export-logs?format=json', '_blank');
+            });
+            
+            document.getElementById('exportCsvBtn').addEventListener('click', () => {
+                window.open('/api/export-logs?format=csv', '_blank');
+            });
+            
+            document.getElementById('exportCompressedBtn').addEventListener('click', () => {
+                window.open('/api/export-logs?format=json&compress=true', '_blank');
+            });
+        });
+    </script>
+</body>
+</html>
