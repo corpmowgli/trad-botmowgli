@@ -1,9 +1,9 @@
-// server.js - Optimized version
+// Optimized server.js
 import express from 'express';
 import http from 'http';
+import { Server as SocketIOServer } from 'socket.io';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import fs from 'fs';
 import compression from 'compression';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
@@ -27,9 +27,8 @@ import {
 } from './middleware/auth.js';
 import { validate, validationRules, sanitizeAllInputs } from './middleware/validation.js';
 import LogService from './services/logService.js';
-import { SocketService } from './services/socketService.js';
 
-// Import trading bot class
+// Import trading bot classes
 import { TradingBot } from './bot.js';
 import { tradingConfig } from './config/tradingConfig.js';
 
@@ -63,7 +62,7 @@ app.use(sanitizeAllInputs);
 // API rate limiting
 app.use('/api/', apiRateLimiter);
 
-// Static files middleware with caching for production
+// Static files middleware
 app.use(express.static(path.join(__dirname, 'public'), {
   maxAge: ENV === 'production' ? '1d' : 0 // Cache in production
 }));
@@ -72,12 +71,14 @@ app.use(express.static(path.join(__dirname, 'public'), {
 const bot = new TradingBot(tradingConfig);
 let isRunning = false;
 
-// Store bot globally for easier access
-global.bot = bot;
-global.botStatus = { isRunning };
-
-// Initialize Socket.IO service
-const socketService = new SocketService(server, { env: ENV });
+// Socket.IO with CORS configuration
+const io = new SocketIOServer(server, {
+  cors: {
+    origin: ENV === 'production' ? false : '*',
+    methods: ['GET', 'POST'],
+    credentials: true
+  }
+});
 
 // Routes
 // ------------------------------------------------------------
@@ -91,172 +92,18 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.post('/api/login', loginRateLimiter, validationRules.login, validate, login);
-app.post('/api/logout', authenticateJWT, logout);
-app.post('/api/refresh-token', refreshToken);
-
-app.get('/api/csrf-token', csrfProtection, (req, res) => {
-  res.json({ csrfToken: req.csrfToken() });
-});
-
-app.get('/api/verify-auth', authenticateJWT, (req, res) => {
-  res.json({
-    authenticated: true,
-    user: {
-      username: req.user.username,
-      role: req.user.role
-    }
-  });
-});
-
-// Protected API Routes
-// ------------------------------------------------------------
-
-// Bot status
-app.get('/api/status', authenticateJWT, (req, res) => {
-  res.json({
-    isRunning,
-    config: tradingConfig,
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    botUptime: isRunning ? bot._calculateRuntime() : null,
-    systemInfo: {
-      memoryUsage: process.memoryUsage(),
-      cpuUsage: process.cpuUsage()
-    }
-  });
-});
-
-// Performance data
-app.get('/api/performance', authenticateJWT, async (req, res) => {
-  try {
-    const report = bot.getPerformanceReport();
-    res.json(report);
-  } catch (error) {
-    console.error('Error getting performance data:', error);
-    res.status(500).json({ error: 'Failed to get performance data' });
-  }
-});
-
-// Trades data with pagination and filtering
-app.get('/api/trades', authenticateJWT, validationRules.getTrades, validate, async (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit) || 50;
-    const offset = parseInt(req.query.offset) || 0;
-    const token = req.query.token;
-    const startDate = req.query.startDate;
-    const endDate = req.query.endDate;
-    
-    // Apply filters if provided
-    let trades;
-    if (token) {
-      trades = bot.logger.getTradesByToken(token);
-    } else if (startDate && endDate) {
-      trades = bot.logger.getTradesByDateRange(startDate, endDate);
-    } else {
-      trades = bot.logger.getRecentTrades(limit, offset);
-    }
-    
-    // Apply pagination if not using token filter
-    const paginatedTrades = token ? trades.slice(offset, offset + limit) : trades;
-    
-    res.json({
-      trades: paginatedTrades,
-      pagination: {
-        total: token ? trades.length : bot.logger.getTotalTradesCount(),
-        limit,
-        offset,
-        hasMore: (offset + paginatedTrades.length) < (token ? trades.length : bot.logger.getTotalTradesCount())
-      }
-    });
-  } catch (error) {
-    console.error('Error getting trades:', error);
-    res.status(500).json({ error: 'Failed to get trades' });
-  }
-});
-
-// Daily performance data with pagination
-app.get('/api/daily-performance', authenticateJWT, validationRules.getDailyPerformance, validate, async (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit) || 30;
-    const offset = parseInt(req.query.offset) || 0;
-    
-    // Get all daily performance and sort chronologically if requested
-    const sortByDate = req.query.sort === 'asc';
-    const allPerformance = bot.logger.getDailyPerformance(sortByDate);
-    
-    // Apply pagination
-    const dailyPerformance = allPerformance.slice(offset, offset + limit);
-    
-    res.json({
-      data: dailyPerformance,
-      pagination: {
-        total: allPerformance.length,
-        limit,
-        offset
-      }
-    });
-  } catch (error) {
-    console.error('Error getting daily performance:', error);
-    res.status(500).json({ error: 'Failed to get daily performance' });
-  }
-});
-
-// Monthly performance data
-app.get('/api/monthly-performance', authenticateJWT, async (req, res) => {
-  try {
-    const monthlyPerformance = bot.logger.getMonthlyPerformance();
-    res.json({ data: monthlyPerformance });
-  } catch (error) {
-    console.error('Error getting monthly performance:', error);
-    res.status(500).json({ error: 'Failed to get monthly performance' });
-  }
-});
-
-// Token performance data
-app.get('/api/token-performance', authenticateJWT, async (req, res) => {
-  try {
-    const minTrades = parseInt(req.query.minTrades) || 0;
-    const tokenPerformance = bot.logger.getTokenPerformance(minTrades);
-    res.json({ data: tokenPerformance });
-  } catch (error) {
-    console.error('Error getting token performance:', error);
-    res.status(500).json({ error: 'Failed to get token performance' });
-  }
-});
-
-// Portfolio data
-app.get('/api/portfolio', authenticateJWT, async (req, res) => {
-  try {
-    const metrics = bot.portfolioManager.getMetrics();
-    res.json(metrics);
-  } catch (error) {
-    console.error('Error getting portfolio data:', error);
-    res.status(500).json({ error: 'Failed to get portfolio data' });
-  }
-});
-
-// Bot control
 app.post('/api/start', authenticateJWT, authorizeRoles('admin'), csrfProtection, async (req, res) => {
   if (!isRunning) {
     try {
-      const success = await bot.start();
+      isRunning = true;
+      bot.start();
       
-      if (success) {
-        isRunning = true;
-        global.botStatus.isRunning = true;
-        
-        // Log the event
-        console.info(`Bot started by user: ${req.user.username}`);
-        
-        // Broadcast status change using socket service
-        socketService.broadcastStatusChange(true);
-        
-        res.json({ status: 'Trading bot started' });
-      } else {
-        res.status(500).json({ error: 'Bot failed to start' });
-      }
+      console.info(`Bot started by user: ${req.user.username}`);
+      
+      res.json({ status: 'Trading bot started' });
+      io.emit('bot_status_change', { isRunning: true });
     } catch (error) {
+      isRunning = false;
       console.error('Error starting trading bot:', error);
       res.status(500).json({ error: 'Failed to start trading bot' });
     }
@@ -270,15 +117,11 @@ app.post('/api/stop', authenticateJWT, authorizeRoles('admin'), csrfProtection, 
     try {
       const report = await bot.stop();
       isRunning = false;
-      global.botStatus.isRunning = false;
       
-      // Log the event
       console.info(`Bot stopped by user: ${req.user.username}`);
       
-      // Broadcast status change using socket service
-      socketService.broadcastStatusChange(false);
-      
       res.json({ status: 'Trading bot stopped', report });
+      io.emit('bot_status_change', { isRunning: false });
     } catch (error) {
       console.error('Error stopping trading bot:', error);
       res.status(500).json({ error: 'Failed to stop trading bot' });
@@ -288,7 +131,7 @@ app.post('/api/stop', authenticateJWT, authorizeRoles('admin'), csrfProtection, 
   }
 });
 
-// Simulation with custom configuration
+// Simulation
 app.post('/api/simulation', authenticateJWT, csrfProtection, validationRules.simulation, validate, async (req, res) => {
   try {
     const { startDate, endDate, config } = req.body;
@@ -296,8 +139,6 @@ app.post('/api/simulation', authenticateJWT, csrfProtection, validationRules.sim
     // If custom config provided, validate it
     let simulationConfig = tradingConfig;
     if (config) {
-      // Deep validate config structure
-      // This would need additional validation logic
       simulationConfig = { ...tradingConfig, ...config };
     }
     
@@ -339,72 +180,105 @@ app.get('/api/export-logs', authenticateJWT, validationRules.exportLogs, validat
   }
 });
 
-// Get HTML reports
-app.get('/api/reports/html', authenticateJWT, async (req, res) => {
-  try {
-    const htmlReport = bot.generateHtmlReport();
-    res.send(htmlReport);
-  } catch (error) {
-    console.error('Error generating HTML report:', error);
-    res.status(500).json({ error: 'Failed to generate HTML report' });
+// Socket.IO real-time updates
+// ------------------------------------------------------------
+io.on('connection', (socket) => {
+  console.log('New client connected', socket.id);
+  
+  // Check authentication for socket connections
+  const token = socket.handshake.auth.token;
+  if (!token) {
+    console.log('Unauthenticated socket connection attempt');
+    socket.emit('auth_error', { message: 'Authentication required' });
+    socket.disconnect();
+    return;
   }
-});
-
-app.get('/api/reports/interactive', authenticateJWT, async (req, res) => {
+  
   try {
-    const interactiveReport = bot.generateInteractiveReport();
-    res.send(interactiveReport);
-  } catch (error) {
-    console.error('Error generating interactive report:', error);
-    res.status(500).json({ error: 'Failed to generate interactive report' });
-  }
-});
-
-// System health endpoint
-app.get('/api/health', async (req, res) => {
-  try {
-    const memory = process.memoryUsage();
-    const health = {
-      status: 'ok',
-      timestamp: new Date().toISOString(),
-      uptime: process.uptime(),
-      memory: {
-        rss: Math.round(memory.rss / 1024 / 1024), // Convert to MB
-        heapTotal: Math.round(memory.heapTotal / 1024 / 1024),
-        heapUsed: Math.round(memory.heapUsed / 1024 / 1024),
-        external: Math.round(memory.external / 1024 / 1024)
-      },
-      services: {
-        bot: isRunning ? 'running' : 'stopped',
-        socket: socketService.getClientCount()
-      }
-    };
+    // Verify token
+    jwt.verify(token, JWT_SECRET);
     
-    res.json(health);
+    // Send current bot status
+    socket.emit('bot_status', { isRunning });
+    
+    // Handle disconnection
+    socket.on('disconnect', () => {
+      console.log('Client disconnected', socket.id);
+    });
+    
+    // Custom event handlers
+    socket.on('request_update', () => {
+      broadcastUpdates(socket);
+    });
+    
   } catch (error) {
-    console.error('Error in health check:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    console.error('Socket authentication error:', error);
+    socket.emit('auth_error', { message: 'Invalid authentication' });
+    socket.disconnect();
   }
 });
 
-// Subscribe to bot events for real-time updates
-bot.on('trade', (trade) => {
-  // Broadcast trade via socket
-  socketService.broadcastTrade(trade);
-});
-
-bot.on('status', (statusUpdate) => {
-  // Broadcast status update
-  socketService.broadcastUpdate({ statusUpdate });
-});
-
-// Regularly broadcast updates to connected clients (every 10 seconds if bot is running)
-setInterval(() => {
-  if (isRunning) {
-    const report = bot.getPerformanceReport();
-    socketService.broadcastUpdate({ report });
+// Regular updates to connected clients
+const broadcastUpdates = async (socket = null) => {
+  try {
+    if (isRunning) {
+      const report = bot.getPerformanceReport();
+      const recentTrades = bot.logger.getRecentTrades(5);
+      const updateData = { 
+        report, 
+        recentTrades, 
+        timestamp: new Date().toISOString() 
+      };
+      
+      if (socket) {
+        // Send only to the requesting socket
+        socket.emit('bot_update', updateData);
+      } else {
+        // Broadcast to all connected clients
+        io.emit('bot_update', updateData);
+      }
+    }
+  } catch (error) {
+    console.error('Error broadcasting updates:', error);
   }
-}, 10000);
+};
+
+// Set interval for regular updates (every 10 seconds)
+setInterval(() => broadcastUpdates(), 10000);
+
+// Scheduled log cleanup
+// ------------------------------------------------------------
+const scheduleLogCleanup = async () => {
+  try {
+    const logService = new LogService(tradingConfig);
+    await logService.cleanupOldLogs(90); // Clean logs older than 90 days
+    console.log('Scheduled log cleanup completed');
+  } catch (error) {
+    console.error('Error during scheduled log cleanup:', error);
+  }
+};
+
+// Schedule next cleanup at midnight
+const scheduleNextCleanup = () => {
+  const now = new Date();
+  const night = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate() + 1, // Tomorrow
+    0, 0, 0 // Midnight
+  );
+  
+  const timeToMidnight = night.getTime() - now.getTime();
+  
+  setTimeout(() => {
+    scheduleLogCleanup();
+    // Schedule next cleanup
+    scheduleNextCleanup();
+  }, timeToMidnight);
+};
+
+// Start the scheduler
+scheduleNextCleanup();
 
 // Error handling middleware
 // ------------------------------------------------------------
@@ -467,11 +341,6 @@ async function gracefulShutdown() {
     }
   }
   
-  // Clean up socket service
-  if (socketService && socketService.cleanup) {
-    socketService.cleanup();
-  }
-  
   // Close server connections
   server.close(() => {
     console.log('Server connections closed');
@@ -492,4 +361,101 @@ async function gracefulShutdown() {
   }, 10000);
 }
 
-export default server;
+export default server;refresh-token', refreshToken);
+
+app.get('/api/csrf-token', csrfProtection, (req, res) => {
+  res.json({ csrfToken: req.csrfToken() });
+});
+
+app.get('/api/verify-auth', authenticateJWT, (req, res) => {
+  res.json({
+    authenticated: true,
+    user: {
+      username: req.user.username,
+      role: req.user.role
+    }
+  });
+});
+
+// Protected API Routes
+// ------------------------------------------------------------
+
+// Bot status
+app.get('/api/status', authenticateJWT, (req, res) => {
+  res.json({
+    isRunning: isRunning,
+    config: tradingConfig,
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
+});
+
+// Performance data
+app.get('/api/performance', authenticateJWT, async (req, res) => {
+  try {
+    const report = bot.getPerformanceReport();
+    res.json(report);
+  } catch (error) {
+    console.error('Error getting performance data:', error);
+    res.status(500).json({ error: 'Failed to get performance data' });
+  }
+});
+
+// Trades data
+app.get('/api/trades', authenticateJWT, validationRules.getTrades, validate, async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = parseInt(req.query.offset) || 0;
+    const trades = bot.logger.getRecentTrades(limit, offset);
+    
+    res.json({
+      trades,
+      pagination: {
+        total: bot.logger.getTotalTradesCount(),
+        limit,
+        offset,
+        hasMore: (offset + trades.length) < bot.logger.getTotalTradesCount()
+      }
+    });
+  } catch (error) {
+    console.error('Error getting trades:', error);
+    res.status(500).json({ error: 'Failed to get trades' });
+  }
+});
+
+// Daily performance data
+app.get('/api/daily-performance', authenticateJWT, validationRules.getDailyPerformance, validate, async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 30;
+    const offset = parseInt(req.query.offset) || 0;
+    const dailyPerformance = bot.logger.getDailyPerformance().slice(offset, offset + limit);
+    
+    res.json({
+      data: dailyPerformance,
+      pagination: {
+        total: bot.logger.getDailyPerformance().length,
+        limit,
+        offset
+      }
+    });
+  } catch (error) {
+    console.error('Error getting daily performance:', error);
+    res.status(500).json({ error: 'Failed to get daily performance' });
+  }
+});
+
+// Portfolio data
+app.get('/api/portfolio', authenticateJWT, async (req, res) => {
+  try {
+    const metrics = bot.portfolioManager.getMetrics();
+    res.json(metrics);
+  } catch (error) {
+    console.error('Error getting portfolio data:', error);
+    res.status(500).json({ error: 'Failed to get portfolio data' });
+  }
+});
+
+// Bot control
+app.post('/api/login', loginRateLimiter, validationRules.login, validate, login);
+app.post('/api/logout', authenticateJWT, logout);
+app.post('/api/

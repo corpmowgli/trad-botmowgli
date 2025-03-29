@@ -1,12 +1,10 @@
-// services/marketDataService.js
+// optimized marketDataService.js
 import axios from 'axios';
 import { delay, retry } from '../utils/helpers.js';
 
 /**
  * Market Data Service
- * 
- * A service for fetching and managing market data from various sources.
- * Includes caching, rate limiting, and retry mechanisms for reliable data access.
+ * Optimized service for fetching and managing market data
  */
 export class MarketDataService {
   /**
@@ -15,73 +13,40 @@ export class MarketDataService {
    */
   constructor(config) {
     this.config = config;
+    this.cache = new Map();
+    this.api = this.initializeApiInstances();
     
-    // Initialize caches with expiration times
-    this.caches = {
-      prices: new Map(),
-      pools: new Map(),
-      tokens: new Map(),
-      coingecko: new Map(),
-      marketData: new Map()
-    };
-    
-    // Cache TTL in milliseconds
-    this.cacheTTL = {
-      prices: 30000,        // 30 seconds for price data
-      pools: 300000,        // 5 minutes for pool data
-      tokens: 300000,       // 5 minutes for token data
-      coingecko: 300000,    // 5 minutes for CoinGecko data
-      marketData: 300000    // 5 minutes for general market data
-    };
-    
-    // Queue for rate limiting requests to each API
-    this.requestQueues = {
-      raydium: [],
-      jupiter: [],
-      coingecko: []
-    };
-    
-    // Rate limits
-    this.rateLimits = {
-      raydium: { requests: 10, period: 60000 },     // 10 requests per minute
-      jupiter: { requests: 30, period: 60000 },     // 30 requests per minute
-      coingecko: { requests: 30, period: 60000 }    // 30 requests per minute for free tier
-    };
-    
-    // Last request timestamps for rate limiting
+    // Rate limits tracking
     this.lastRequests = {
       raydium: [],
       jupiter: [],
       coingecko: []
     };
-    
-    // Initialize axios instances with default configs
-    this.api = {
+  }
+
+  /**
+   * Initialize API instances
+   * @private
+   * @returns {Object} API instances
+   */
+  initializeApiInstances() {
+    const instances = {
       raydium: axios.create({
         baseURL: this.config.api.raydiumBaseUrl,
-        timeout: 10000,
-        headers: {
-          'Content-Type': 'application/json'
-        }
+        timeout: 10000
       }),
       jupiter: axios.create({
         baseURL: this.config.api.jupiterBaseUrl,
-        timeout: 10000,
-        headers: {
-          'Content-Type': 'application/json'
-        }
+        timeout: 10000
       }),
       coingecko: axios.create({
         baseURL: this.config.api.coingeckoBaseUrl,
-        timeout: 15000,
-        headers: {
-          'Content-Type': 'application/json'
-        }
+        timeout: 15000
       })
     };
     
     // Add response interceptors for error handling
-    Object.values(this.api).forEach(instance => {
+    Object.values(instances).forEach(instance => {
       instance.interceptors.response.use(
         response => response,
         async error => {
@@ -96,48 +61,56 @@ export class MarketDataService {
             return axios(error.config);
           }
           
-          // Handle other errors
           return Promise.reject(error);
         }
       );
     });
     
-    // Start processing request queues
-    this.startQueueProcessing();
+    return instances;
   }
 
   /**
-   * Get pool data from Raydium API
-   * @param {string} poolId - Pool identifier
-   * @returns {Promise<Object>} Pool data
+   * Unified API request method with caching and rate limit handling
+   * @private
+   * @param {string} apiName - API name ('raydium', 'jupiter', 'coingecko')
+   * @param {string} endpoint - API endpoint
+   * @param {Object} params - Request parameters
+   * @param {string} cacheKey - Cache key
+   * @param {number} cacheDuration - Cache duration in ms (default: 30s)
+   * @returns {Promise<Object>} Response data
    */
-  async getPoolData(poolId) {
-    // Check cache first
-    const cachedData = this.getCachedData('pools', poolId);
+  async apiRequest(apiName, endpoint, params, cacheKey, cacheDuration = 30000) {
+    // Check cache
+    const cachedData = this.getCachedItem(cacheKey);
     if (cachedData) return cachedData;
     
-    // Queue the request with a promise for the result
-    return new Promise((resolve, reject) => {
-      this.queueRequest('raydium', async () => {
-        try {
-          const response = await retry(
-            () => this.api.raydium.get(`/pools/${poolId}`),
-            3,  // max retries
-            1000 // base delay in ms
-          );
-          
-          const data = response.data;
-          
-          // Cache the result
-          this.setCacheData('pools', poolId, data);
-          
-          resolve(data);
-        } catch (error) {
-          console.error(`Error fetching pool data for ${poolId}:`, error);
-          reject(error);
-        }
-      });
-    });
+    // Handle rate limits
+    const needToWait = this.checkRateLimit(apiName);
+    if (needToWait > 0) {
+      await delay(needToWait);
+    }
+    
+    // Record request for rate limiting
+    this.recordRequest(apiName);
+    
+    // Make request
+    try {
+      const response = await retry(
+        () => this.api[apiName].get(endpoint, { params }),
+        3,  // max retries
+        1000 // base delay
+      );
+      
+      const data = response.data;
+      
+      // Cache result
+      this.setCacheItem(cacheKey, data, cacheDuration);
+      
+      return data;
+    } catch (error) {
+      console.error(`API request error (${apiName}/${endpoint}):`, error);
+      throw error;
+    }
   }
 
   /**
@@ -146,43 +119,16 @@ export class MarketDataService {
    * @returns {Promise<number|null>} Token price in USD or null if not available
    */
   async getTokenPrice(tokenMint) {
-    try {
-      // Check cache first
-      const cachedPrice = this.getCachedData('prices', tokenMint);
-      if (cachedPrice !== undefined) return cachedPrice;
-      
-      // Queue the request with a promise for the result
-      return new Promise((resolve, reject) => {
-        this.queueRequest('jupiter', async () => {
-          try {
-            const response = await retry(
-              () => this.api.jupiter.get(`/price`, {
-                params: { ids: [tokenMint] }
-              }),
-              3,  // max retries
-              1000 // base delay
-            );
-            
-            const price = response.data.data[tokenMint]?.price || null;
-            
-            // Cache the result
-            this.setCacheData('prices', tokenMint, price);
-            
-            resolve(price);
-          } catch (error) {
-            console.error(`Error fetching price for ${tokenMint}:`, error);
-            resolve(null); // Resolve with null instead of rejecting
-          }
-        });
-      });
-    } catch (error) {
-      console.error(`Error in getTokenPrice for ${tokenMint}:`, error);
-      return null;
-    }
+    return this.apiRequest(
+      'jupiter',
+      '/price',
+      { ids: [tokenMint] },
+      `price_${tokenMint}`
+    ).then(data => data.data?.[tokenMint]?.price || null);
   }
 
   /**
-   * Get multiple token prices in a single request
+   * Get multiple token prices in a batch
    * @param {Array<string>} tokenMints - Array of token mint addresses
    * @returns {Promise<Object>} Object mapping token addresses to prices
    */
@@ -191,469 +137,196 @@ export class MarketDataService {
       return {};
     }
     
-    // Filter out tokens we already have in cache
-    const uncachedTokens = tokenMints.filter(token => 
-      this.getCachedData('prices', token) === undefined
+    // Split into batches of 100 (Jupiter limit)
+    const batchSize = 100;
+    const batches = [];
+    
+    for (let i = 0; i < tokenMints.length; i += batchSize) {
+      batches.push(tokenMints.slice(i, i + batchSize));
+    }
+    
+    // Process batches in parallel
+    const results = await Promise.all(
+      batches.map(batch => 
+        this.apiRequest(
+          'jupiter',
+          '/price',
+          { ids: batch },
+          `prices_batch_${batch.join('_').substring(0, 50)}`
+        )
+      )
     );
     
-    // If all tokens are cached, return from cache
-    if (uncachedTokens.length === 0) {
-      return tokenMints.reduce((result, token) => {
-        result[token] = this.getCachedData('prices', token);
-        return result;
-      }, {});
-    }
-    
-    try {
-      // Queue the request with a promise for the result
-      return new Promise((resolve, reject) => {
-        this.queueRequest('jupiter', async () => {
-          try {
-            // Jupiter API has a limit on request size, so batch if needed
-            const batchSize = 100;
-            const batches = [];
-            
-            for (let i = 0; i < uncachedTokens.length; i += batchSize) {
-              batches.push(uncachedTokens.slice(i, i + batchSize));
-            }
-            
-            // Process each batch
-            const batchResults = await Promise.all(
-              batches.map(async batch => {
-                const response = await retry(
-                  () => this.api.jupiter.get(`/price`, {
-                    params: { ids: batch }
-                  }),
-                  3,  // max retries
-                  1000 // base delay
-                );
-                
-                return response.data.data || {};
-              })
-            );
-            
-            // Combine batch results
-            const priceData = batchResults.reduce((result, batch) => ({ ...result, ...batch }), {});
-            
-            // Cache each price
-            for (const [token, data] of Object.entries(priceData)) {
-              this.setCacheData('prices', token, data.price || null);
-            }
-            
-            // Combine with cached data for the final result
-            const result = tokenMints.reduce((result, token) => {
-              result[token] = priceData[token]?.price || this.getCachedData('prices', token) || null;
-              return result;
-            }, {});
-            
-            resolve(result);
-          } catch (error) {
-            console.error(`Error fetching batch token prices:`, error);
-            
-            // Fall back to individual price fetches
-            const result = {};
-            for (const token of tokenMints) {
-              result[token] = await this.getTokenPrice(token);
-            }
-            
-            resolve(result);
-          }
+    // Combine results
+    return results.reduce((combined, result) => {
+      if (result.data) {
+        Object.entries(result.data).forEach(([token, data]) => {
+          combined[token] = data.price;
         });
-      });
-    } catch (error) {
-      console.error(`Error in getBatchTokenPrices:`, error);
-      return {};
-    }
+      }
+      return combined;
+    }, {});
   }
 
   /**
-   * Aggregate comprehensive token data from multiple sources
+   * Get historical price data
    * @param {string} tokenMint - Token mint address
-   * @returns {Promise<Object>} Combined token data
+   * @param {number} startTime - Start timestamp
+   * @param {number} endTime - End timestamp
+   * @param {string} timeframe - Timeframe ('1h', '4h', '1d')
+   * @returns {Promise<Array>} Historical price data
+   */
+  async getHistoricalPrices(tokenMint, startTime, endTime, timeframe = '1h') {
+    const cacheKey = `history_${tokenMint}_${timeframe}_${startTime}_${endTime}`;
+    
+    return this.apiRequest(
+      'raydium',
+      '/charts',
+      { tokenMint, timeframe, startTime, endTime },
+      cacheKey,
+      300000 // Cache for 5 minutes
+    );
+  }
+
+  /**
+   * Get qualified tokens based on liquidity and volume
+   * @param {number} minLiquidity - Minimum liquidity threshold
+   * @param {number} minVolume24h - Minimum 24h volume threshold
+   * @returns {Promise<Array>} Qualified tokens
+   */
+  async getQualifiedTokens(minLiquidity = 100000, minVolume24h = 50000) {
+    const cacheKey = `qualified_tokens_${minLiquidity}_${minVolume24h}`;
+    
+    const tokens = await this.apiRequest(
+      'raydium',
+      '/tokens',
+      { limit: 200, sortBy: 'volume24h', order: 'desc' },
+      cacheKey,
+      300000 // Cache for 5 minutes
+    );
+    
+    // Filter based on criteria
+    return tokens.filter(token => 
+      token.liquidity >= minLiquidity && 
+      token.volume24h >= minVolume24h
+    );
+  }
+
+  /**
+   * Aggregate token data from multiple sources
+   * @param {string} tokenMint - Token mint address
+   * @returns {Promise<Object>} Aggregated token data
    */
   async aggregateTokenData(tokenMint) {
-    // Check cache first
-    const cachedData = this.getCachedData('marketData', tokenMint);
-    if (cachedData) return cachedData;
+    const cacheKey = `aggregated_${tokenMint}`;
+    const cached = this.getCachedItem(cacheKey);
+    if (cached) return cached;
     
     try {
-      // Fetch data from multiple sources in parallel
-      const [raydiumData, coingeckoData, priceData] = await Promise.all([
-        this.getRaydiumTokenData(tokenMint).catch(() => ({})),
-        this.getCoingeckoTokenData(tokenMint).catch(() => ({})),
-        this.getTokenPrice(tokenMint).catch(() => null)
+      // Get data from different sources in parallel
+      const [price, tokenInfo] = await Promise.all([
+        this.getTokenPrice(tokenMint).catch(() => null),
+        this.apiRequest(
+          'raydium',
+          `/tokens/${tokenMint}`,
+          {},
+          `token_info_${tokenMint}`,
+          300000 // 5 minutes
+        ).catch(() => ({}))
       ]);
       
-      // Combine the data, preferring Raydium for liquidity/volume and CoinGecko for market metrics
-      const aggregatedData = {
+      // Combine data
+      const aggregated = {
         token: tokenMint,
-        price: priceData || raydiumData.price || coingeckoData.usd || null,
-        liquidity: raydiumData.liquidity || 0,
-        volume24h: raydiumData.volume24h || 0,
-        priceChange24h: coingeckoData.usd_24h_change || raydiumData.priceChange24h || 0,
-        marketCap: coingeckoData.usd_market_cap || 0,
-        fullyDilutedValuation: coingeckoData.fdv || 0,
-        timestamp: Date.now(),
-        sources: {
-          price: priceData ? 'jupiter' : (raydiumData.price ? 'raydium' : 'coingecko'),
-          marketData: Object.keys(coingeckoData).length > 0 ? 'coingecko' : 'raydium'
-        }
+        price: price || tokenInfo.price || 0,
+        liquidity: tokenInfo.liquidity || 0,
+        volume24h: tokenInfo.volume24h || 0,
+        priceChange24h: tokenInfo.priceChange24h || 0,
+        marketCap: tokenInfo.marketCap || 0,
+        timestamp: Date.now()
       };
       
-      // Cache the combined data
-      this.setCacheData('marketData', tokenMint, aggregatedData);
-      
-      return aggregatedData;
+      this.setCacheItem(cacheKey, aggregated, 60000); // 1 minute
+      return aggregated;
     } catch (error) {
       console.error(`Error aggregating token data for ${tokenMint}:`, error);
-      
-      // Return a minimal data structure with defaults
       return {
         token: tokenMint,
         price: null,
         liquidity: 0,
         volume24h: 0,
         priceChange24h: 0,
-        marketCap: 0,
-        error: error.message,
-        timestamp: Date.now()
+        error: error.message
       };
     }
   }
 
   /**
-   * Get token data from Raydium API
-   * @param {string} tokenMint - Token mint address
-   * @returns {Promise<Object>} Token data from Raydium
-   */
-  async getRaydiumTokenData(tokenMint) {
-    // Check cache first
-    const cachedData = this.getCachedData('tokens', tokenMint);
-    if (cachedData) return cachedData;
-    
-    // Queue the request with a promise for the result
-    return new Promise((resolve, reject) => {
-      this.queueRequest('raydium', async () => {
-        try {
-          const response = await retry(
-            () => this.api.raydium.get(`/tokens/${tokenMint}`),
-            3,  // max retries
-            1000 // base delay
-          );
-          
-          const data = response.data;
-          
-          // Cache the result
-          this.setCacheData('tokens', tokenMint, data);
-          
-          resolve(data);
-        } catch (error) {
-          console.error(`Error fetching Raydium token data for ${tokenMint}:`, error);
-          reject(error);
-        }
-      });
-    });
-  }
-
-  /**
-   * Get token data from CoinGecko API
-   * @param {string} tokenMint - Token mint address
-   * @returns {Promise<Object>} Token data from CoinGecko
-   */
-  async getCoingeckoTokenData(tokenMint) {
-    // Check cache first
-    const cachedData = this.getCachedData('coingecko', tokenMint);
-    if (cachedData) return cachedData;
-    
-    // Queue the request with a promise for the result
-    return new Promise((resolve, reject) => {
-      this.queueRequest('coingecko', async () => {
-        try {
-          const response = await retry(
-            () => this.api.coingecko.get(`/simple/token_price/solana`, {
-              params: {
-                contract_addresses: tokenMint.toLowerCase(),
-                vs_currencies: 'usd',
-                include_market_cap: true,
-                include_24hr_vol: true,
-                include_24hr_change: true,
-                include_last_updated_at: true
-              }
-            }),
-            3,  // max retries
-            1000 // base delay
-          );
-          
-          const data = response.data[tokenMint.toLowerCase()] || {};
-          
-          // Cache the result
-          this.setCacheData('coingecko', tokenMint, data);
-          
-          resolve(data);
-        } catch (error) {
-          console.error(`Error fetching CoinGecko token data for ${tokenMint}:`, error);
-          reject(error);
-        }
-      });
-    });
-  }
-
-  /**
-   * Get historical price data for a token
-   * @param {string} tokenMint - Token mint address
-   * @param {string} timeframe - Timeframe ('1h', '4h', '1d', '1w')
-   * @param {number} limit - Number of data points
-   * @returns {Promise<Array>} Historical price data
-   */
-  async getHistoricalPrices(tokenMint, timeframe = '1h', limit = 100) {
-    const cacheKey = `${tokenMint}_${timeframe}_${limit}`;
-    
-    // Check cache first
-    const cachedData = this.getCachedData('prices', cacheKey);
-    if (cachedData) return cachedData;
-    
-    // Queue the request with a promise for the result
-    return new Promise((resolve, reject) => {
-      this.queueRequest('raydium', async () => {
-        try {
-          const response = await retry(
-            () => this.api.raydium.get(`/charts`, {
-              params: {
-                tokenMint,
-                timeframe,
-                limit
-              }
-            }),
-            3,  // max retries
-            1000 // base delay
-          );
-          
-          const data = response.data || [];
-          
-          // Cache the result
-          this.setCacheData('prices', cacheKey, data);
-          
-          resolve(data);
-        } catch (error) {
-          console.error(`Error fetching historical prices for ${tokenMint}:`, error);
-          reject(error);
-        }
-      });
-    });
-  }
-
-  /**
-   * Get list of top tokens by volume
-   * @param {number} limit - Number of tokens to return
-   * @returns {Promise<Array>} Top tokens
-   */
-  async getTopTokens(limit = 50) {
-    const cacheKey = `top_tokens_${limit}`;
-    
-    // Check cache first
-    const cachedData = this.getCachedData('marketData', cacheKey);
-    if (cachedData) return cachedData;
-    
-    // Queue the request with a promise for the result
-    return new Promise((resolve, reject) => {
-      this.queueRequest('raydium', async () => {
-        try {
-          const response = await retry(
-            () => this.api.raydium.get(`/tokens`, {
-              params: {
-                limit,
-                sortBy: 'volume24h',
-                order: 'desc'
-              }
-            }),
-            3,  // max retries
-            1000 // base delay
-          );
-          
-          const data = response.data || [];
-          
-          // Cache the result
-          this.setCacheData('marketData', cacheKey, data);
-          
-          resolve(data);
-        } catch (error) {
-          console.error(`Error fetching top tokens:`, error);
-          reject(error);
-        }
-      });
-    });
-  }
-
-  /**
-   * Get global market data
-   * @returns {Promise<Object>} Global market data
-   */
-  async getGlobalMarketData() {
-    const cacheKey = 'global_market';
-    
-    // Check cache first
-    const cachedData = this.getCachedData('marketData', cacheKey);
-    if (cachedData) return cachedData;
-    
-    // Queue the request with a promise for the result
-    return new Promise((resolve, reject) => {
-      this.queueRequest('coingecko', async () => {
-        try {
-          const response = await retry(
-            () => this.api.coingecko.get(`/global`),
-            3,  // max retries
-            1000 // base delay
-          );
-          
-          const data = response.data.data || {};
-          
-          // Cache the result
-          this.setCacheData('marketData', cacheKey, data);
-          
-          resolve(data);
-        } catch (error) {
-          console.error(`Error fetching global market data:`, error);
-          reject(error);
-        }
-      });
-    });
-  }
-
-  /**
-   * Check if the market is open (e.g., for stock/forex markets)
-   * For crypto which trades 24/7, this always returns true
-   * @returns {boolean} Whether the market is open
-   */
-  isMarketOpen() {
-    // Cryptocurrency markets are always open
-    return true;
-  }
-
-  /**
-   * Get cached data if not expired
+   * Get cached item if not expired
    * @private
-   * @param {string} cacheType - Type of cache to check
    * @param {string} key - Cache key
-   * @returns {*} Cached data or undefined if not found or expired
+   * @returns {*} Cached data or undefined
    */
-  getCachedData(cacheType, key) {
-    const cache = this.caches[cacheType];
-    if (!cache) return undefined;
+  getCachedItem(key) {
+    const item = this.cache.get(key);
+    if (!item) return undefined;
     
-    const cacheEntry = cache.get(key);
-    if (!cacheEntry) return undefined;
-    
-    // Check if cache has expired
-    if (Date.now() - cacheEntry.timestamp > this.cacheTTL[cacheType]) {
-      cache.delete(key);
+    if (Date.now() - item.timestamp > item.duration) {
+      this.cache.delete(key);
       return undefined;
     }
     
-    return cacheEntry.data;
+    return item.data;
   }
 
   /**
-   * Set data in cache with current timestamp
+   * Set item in cache
    * @private
-   * @param {string} cacheType - Type of cache to update
    * @param {string} key - Cache key
    * @param {*} data - Data to cache
+   * @param {number} duration - Cache duration in ms
    */
-  setCacheData(cacheType, key, data) {
-    const cache = this.caches[cacheType];
-    if (!cache) return;
-    
-    cache.set(key, {
+  setCacheItem(key, data, duration) {
+    this.cache.set(key, {
       data,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      duration
     });
     
-    // Clean up old cache entries periodically
-    if (cache.size > 1000) {
-      this.cleanupCache(cacheType);
+    // Clean up cache if it gets too large
+    if (this.cache.size > 1000) {
+      this.cleanupCache();
     }
   }
 
   /**
-   * Clean up expired entries from a cache
+   * Clean up expired cache entries
    * @private
-   * @param {string} cacheType - Type of cache to clean
    */
-  cleanupCache(cacheType) {
-    const cache = this.caches[cacheType];
-    if (!cache) return;
-    
+  cleanupCache() {
     const now = Date.now();
     
-    // Remove expired entries
-    for (const [key, entry] of cache.entries()) {
-      if (now - entry.timestamp > this.cacheTTL[cacheType]) {
-        cache.delete(key);
+    for (const [key, item] of this.cache.entries()) {
+      if (now - item.timestamp > item.duration) {
+        this.cache.delete(key);
       }
     }
   }
 
   /**
-   * Add a request to the appropriate queue
-   * @private
-   * @param {string} api - API name ('raydium', 'jupiter', 'coingecko')
-   * @param {Function} requestFn - Function to execute the request
-   */
-  queueRequest(api, requestFn) {
-    this.requestQueues[api].push(requestFn);
-  }
-
-  /**
-   * Start processing the request queues with rate limiting
-   * @private
-   */
-  startQueueProcessing() {
-    // Process each API queue independently
-    for (const api of Object.keys(this.requestQueues)) {
-      this.processQueue(api);
-    }
-  }
-
-  /**
-   * Process a single API's request queue with rate limiting
+   * Record API request for rate limiting
    * @private
    * @param {string} api - API name
    */
-  async processQueue(api) {
-    // Process queue continuously
-    while (true) {
-      // Check if the queue has pending requests
-      if (this.requestQueues[api].length > 0) {
-        // Check if we need to wait for rate limit
-        const needToWait = this.checkRateLimit(api);
-        
-        if (needToWait) {
-          // Wait for the next request slot
-          await delay(needToWait);
-        }
-        
-        // Process the next request
-        const nextRequest = this.requestQueues[api].shift();
-        if (nextRequest) {
-          // Record the request timestamp
-          this.lastRequests[api].push(Date.now());
-          
-          // Keep only the last N requests in the tracking array
-          const limit = this.rateLimits[api].requests;
-          if (this.lastRequests[api].length > limit) {
-            this.lastRequests[api] = this.lastRequests[api].slice(-limit);
-          }
-          
-          // Execute the request (but don't await it to allow parallel processing)
-          nextRequest().catch(error => {
-            console.error(`Error processing ${api} request:`, error);
-          });
-        }
-      }
-      
-      // Slight delay before checking the queue again to avoid CPU spin
-      await delay(50);
-    }
+  recordRequest(api) {
+    if (!this.lastRequests[api]) return;
+    
+    this.lastRequests[api].push(Date.now());
+    
+    // Keep only recent requests
+    this.lastRequests[api] = this.lastRequests[api].filter(
+      time => Date.now() - time < 60000 // Last minute
+    );
   }
 
   /**
@@ -663,52 +336,49 @@ export class MarketDataService {
    * @returns {number} Milliseconds to wait or 0 if no wait needed
    */
   checkRateLimit(api) {
-    const { requests, period } = this.rateLimits[api];
-    const recentRequests = this.lastRequests[api];
+    if (!this.lastRequests[api]) return 0;
+    
+    // Define rate limits for each API
+    const rateLimits = {
+      raydium: { requests: 10, period: 60000 },     // 10 requests per minute
+      jupiter: { requests: 30, period: 60000 },     // 30 requests per minute
+      coingecko: { requests: 30, period: 60000 }    // 30 requests per minute
+    };
+    
+    const { requests, period } = rateLimits[api] || { requests: 10, period: 60000 };
+    const recentRequests = this.lastRequests[api].filter(
+      time => Date.now() - time < period
+    );
     
     // If we haven't made enough requests yet, no need to wait
-    if (recentRequests.length < requests) {
-      return 0;
-    }
+    if (recentRequests.length < requests) return 0;
     
-    // Get the oldest request in our tracking window
-    const oldestRequest = recentRequests[0];
-    const now = Date.now();
+    // Calculate wait time until next request slot opens
+    const oldestRequest = Math.min(...recentRequests);
+    const waitTime = period - (Date.now() - oldestRequest);
     
-    // If the oldest request is outside the period, no need to wait
-    if (now - oldestRequest >= period) {
-      return 0;
-    }
-    
-    // Calculate how long we need to wait
-    return period - (now - oldestRequest);
+    return Math.max(0, waitTime);
   }
-
+  
   /**
-   * Clear all caches
+   * Clear the cache
    */
-  clearCaches() {
-    for (const cache of Object.values(this.caches)) {
-      cache.clear();
-    }
+  clearCache() {
+    this.cache.clear();
   }
-
+  
   /**
    * Get cache statistics
-   * @returns {Object} Cache statistics
+   * @returns {Object} Cache stats
    */
   getCacheStats() {
-    const stats = {};
-    
-    for (const [type, cache] of Object.entries(this.caches)) {
-      stats[type] = {
-        size: cache.size,
-        ttl: this.cacheTTL[type] / 1000 // Convert to seconds
-      };
-    }
-    
-    return stats;
+    return {
+      size: this.cache.size,
+      apis: {
+        raydium: this.lastRequests.raydium.length,
+        jupiter: this.lastRequests.jupiter.length,
+        coingecko: this.lastRequests.coingecko.length
+      }
+    };
   }
 }
-
-export default MarketDataService;

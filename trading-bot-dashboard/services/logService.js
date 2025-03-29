@@ -1,4 +1,4 @@
-// services/logService.js
+// Optimized logService.js
 import fs from 'fs';
 import path from 'path';
 import { createGzip } from 'zlib';
@@ -8,7 +8,7 @@ import { fileURLToPath } from 'url';
 import { Readable } from 'stream';
 import { stringify } from 'csv-stringify';
 
-// Pour obtenir les chemins d'accès en utilisant ESM
+// For path resolution with ESM
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -17,15 +17,21 @@ const pipelineAsync = promisify(pipeline);
 class LogService {
   constructor(config) {
     this.config = config;
-    this.logsDir = path.join(__dirname, '..', config.logging.filePath || 'logs/trades');
+    this.logsDir = path.join(__dirname, '..', config.logging?.filePath || 'logs/trades');
     
-    // Créer le répertoire des logs s'il n'existe pas
+    // Create logs directory if it doesn't exist
     if (!fs.existsSync(this.logsDir)) {
       fs.mkdirSync(this.logsDir, { recursive: true });
     }
   }
 
-  // Exporter les logs avec streaming et pagination
+  /**
+   * Unified method for streaming logs
+   * @param {Object} res - Response object
+   * @param {string} format - Output format
+   * @param {Object} options - Stream options
+   * @returns {Promise<boolean>} Success status
+   */
   async streamLogs(res, format = 'json', options = {}) {
     const { 
       startDate, 
@@ -36,43 +42,24 @@ class LogService {
     } = options;
     
     try {
-      // Déterminer le nom du fichier et les headers en fonction du format
+      // Determine filename and content type
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      let filename, contentType;
+      const filename = `trading_logs_${timestamp}.${format}${compress ? '.gz' : ''}`;
+      const contentType = format === 'json' ? 'application/json' : 'text/csv';
       
-      if (format === 'json') {
-        filename = `trading_logs_${timestamp}.json`;
-        contentType = 'application/json';
-      } else if (format === 'csv') {
-        filename = `trading_logs_${timestamp}.csv`;
-        contentType = 'text/csv';
-      } else {
-        throw new Error('Format non supporté');
-      }
-      
-      // Ajouter l'extension .gz si compression
-      if (compress) {
-        filename += '.gz';
-        contentType += '+gzip';
-      }
-      
-      // Définir les headers de réponse
-      res.setHeader('Content-Type', contentType);
+      // Set headers
+      res.setHeader('Content-Type', compress ? `${contentType}+gzip` : contentType);
       res.setHeader('Content-Disposition', `attachment; filename=${filename}`);
       
-      // Filtrer et paginer les logs
+      // Get filtered logs
       const logs = await this.getFilteredLogs(startDate, endDate, page, limit);
       
-      // Créer le stream de données en fonction du format
-      let dataStream;
+      // Create appropriate data stream
+      const dataStream = format === 'json' 
+        ? this.createJsonStream(logs) 
+        : this.createCsvStream(logs);
       
-      if (format === 'json') {
-        dataStream = this.createJsonStream(logs);
-      } else {
-        dataStream = this.createCsvStream(logs);
-      }
-      
-      // Appliquer la compression si demandée
+      // Handle compression if requested
       if (compress) {
         const gzip = createGzip();
         await pipelineAsync(dataStream, gzip, res);
@@ -87,15 +74,17 @@ class LogService {
     }
   }
   
-  // Obtenir les logs filtrés par date et paginés
+  /**
+   * Get logs filtered by date and paginated
+   * @private
+   */
   async getFilteredLogs(startDate, endDate, page, limit) {
     try {
-      // Récupérer tous les logs
+      // Get all logs
       const allLogs = await this.getAllLogs();
       
+      // Apply date filtering if specified
       let filteredLogs = allLogs;
-      
-      // Filtrer par date si spécifié
       if (startDate || endDate) {
         const start = startDate ? new Date(startDate) : new Date(0);
         const end = endDate ? new Date(endDate) : new Date();
@@ -106,21 +95,21 @@ class LogService {
         });
       }
       
-      // Calculer la pagination
+      // Apply pagination
       const startIndex = (page - 1) * limit;
-      const endIndex = page * limit;
-      
-      return filteredLogs.slice(startIndex, endIndex);
+      return filteredLogs.slice(startIndex, startIndex + limit);
     } catch (error) {
       console.error('Error filtering logs:', error);
       return [];
     }
   }
   
-  // Créer un stream JSON
+  /**
+   * Create a JSON stream from logs
+   * @private
+   */
   createJsonStream(data) {
     return new Readable({
-      objectMode: true,
       read() {
         this.push(JSON.stringify(data, null, 2));
         this.push(null);
@@ -128,26 +117,23 @@ class LogService {
     });
   }
   
-  // Créer un stream CSV
+  /**
+   * Create a CSV stream from logs
+   * @private
+   */
   createCsvStream(data) {
     if (!data || data.length === 0) {
-      // Si aucune donnée, créer un stream vide avec entêtes
-      const emptyData = [{}];
-      const stringifier = stringify({
-        header: true,
-        columns: ['timestamp', 'token', 'entryPrice', 'exitPrice', 'amount', 'profit', 'signal']
-      });
-      
+      // Empty data - create stream with headers only
+      const columns = ['timestamp', 'token', 'entryPrice', 'exitPrice', 'amount', 'profit'];
+      const stringifier = stringify({ header: true, columns });
       const inputStream = new Readable({
         objectMode: true,
-        read() {
-          this.push(null);
-        }
+        read() { this.push(null); }
       });
-      
       return inputStream.pipe(stringifier);
     }
     
+    // Normal case with data
     const stringifier = stringify({
       header: true,
       columns: Object.keys(data[0])
@@ -164,11 +150,13 @@ class LogService {
     return inputStream.pipe(stringifier);
   }
   
-  // Récupérer tous les logs
+  /**
+   * Get all logs from storage
+   * @private
+   */
   async getAllLogs() {
     try {
       const files = await fs.promises.readdir(this.logsDir);
-      
       let allLogs = [];
       
       for (const file of files) {
@@ -193,23 +181,29 @@ class LogService {
     }
   }
   
-  // Sauvegarder des logs en mode append
+  /**
+   * Append logs to a file
+   * @param {Array} logs - Array of logs to append
+   * @returns {Promise<boolean>} Success status
+   */
   async appendLogs(logs) {
+    if (!Array.isArray(logs) || logs.length === 0) return false;
+    
     const logFile = path.join(this.logsDir, `trades_${new Date().toISOString().split('T')[0]}.json`);
     
     try {
       let existingLogs = [];
       
-      // Charger les logs existants si le fichier existe
+      // Load existing logs if file exists
       if (fs.existsSync(logFile)) {
         const data = await fs.promises.readFile(logFile, 'utf8');
         existingLogs = JSON.parse(data);
       }
       
-      // Ajouter les nouveaux logs
+      // Append new logs
       const updatedLogs = [...existingLogs, ...logs];
       
-      // Écrire dans le fichier
+      // Write back to file
       await fs.promises.writeFile(logFile, JSON.stringify(updatedLogs, null, 2));
       
       return true;
@@ -219,28 +213,36 @@ class LogService {
     }
   }
   
-  // Nettoyer les anciens logs
+  /**
+   * Clean up logs older than specified days
+   * @param {number} olderThanDays - Days threshold for deletion
+   * @returns {Promise<number>} Number of files deleted
+   */
   async cleanupOldLogs(olderThanDays = 90) {
     try {
       const files = await fs.promises.readdir(this.logsDir);
       const now = new Date();
+      let deletedCount = 0;
       
       for (const file of files) {
-        const filePath = path.join(this.logsDir, file);
-        const stats = await fs.promises.stat(filePath);
-        
-        const fileAge = (now - stats.mtime) / (1000 * 60 * 60 * 24);
-        
-        if (fileAge > olderThanDays) {
-          await fs.promises.unlink(filePath);
-          console.log(`Deleted old log file: ${file}`);
+        if (file.endsWith('.json')) {
+          const filePath = path.join(this.logsDir, file);
+          const stats = await fs.promises.stat(filePath);
+          
+          const fileAge = (now - stats.mtime) / (1000 * 60 * 60 * 24);
+          
+          if (fileAge > olderThanDays) {
+            await fs.promises.unlink(filePath);
+            deletedCount++;
+            console.log(`Deleted old log file: ${file}`);
+          }
         }
       }
       
-      return true;
+      return deletedCount;
     } catch (error) {
       console.error('Error cleaning up old logs:', error);
-      throw error;
+      return -1;
     }
   }
 }

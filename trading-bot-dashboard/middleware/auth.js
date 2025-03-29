@@ -1,4 +1,4 @@
-// middleware/auth.js
+// Streamlined auth.js
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcrypt';
 import { rateLimit } from 'express-rate-limit';
@@ -59,56 +59,14 @@ export const csrfProtection = csurf({
 
 // JWT Authentication Middleware
 export const authenticateJWT = (req, res, next) => {
-  // Get token from cookies or Authorization header
-  const token = req.cookies.token || 
-                (req.headers.authorization && req.headers.authorization.split(' ')[1]);
-
-  if (!token) {
-    return res.status(401).json({ error: 'Accès non autorisé' });
-  }
+  const token = req.cookies.token || (req.headers.authorization?.split(' ')?.[1]);
+  if (!token) return res.status(401).json({ error: 'Accès non autorisé' });
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    
-    // Check if token is about to expire (less than 5 minutes left)
-    const tokenExp = new Date(decoded.exp * 1000);
-    const now = new Date();
-    const fiveMinutes = 5 * 60 * 1000;
-    
-    if ((tokenExp.getTime() - now.getTime()) < fiveMinutes) {
-      // Token is about to expire, issue a new one if refresh token is valid
-      const refreshToken = req.cookies.refreshToken;
-      if (refreshToken) {
-        try {
-          const refreshDecoded = jwt.verify(refreshToken, JWT_SECRET);
-          const user = users.find(u => u.id === refreshDecoded.id);
-          
-          if (user && user.refreshTokens.includes(refreshToken)) {
-            // Create new token
-            const newToken = generateAccessToken(user);
-            
-            // Set new token in cookie
-            res.cookie('token', newToken, {
-              httpOnly: true,
-              secure: process.env.NODE_ENV === 'production',
-              sameSite: 'strict',
-              maxAge: 24 * 60 * 60 * 1000 // 24 hours
-            });
-            
-            // Update decoded with new token
-            decoded.exp = jwt.decode(newToken).exp;
-          }
-        } catch (err) {
-          // If refresh token verification fails, continue with current token
-          console.error('Error refreshing token:', err);
-        }
-      }
-    }
-    
     req.user = decoded;
     next();
   } catch (error) {
-    // Token verification failed
     if (error.name === 'TokenExpiredError') {
       return res.status(401).json({ error: 'Session expirée', code: 'TOKEN_EXPIRED' });
     }
@@ -116,14 +74,11 @@ export const authenticateJWT = (req, res, next) => {
   }
 };
 
-// Role Authorization Middleware
-export const authorizeRoles = (...roles) => {
-  return (req, res, next) => {
-    if (!req.user || !roles.includes(req.user.role)) {
-      return res.status(403).json({ error: 'Accès interdit' });
-    }
-    next();
-  };
+export const authorizeRoles = (...roles) => (req, res, next) => {
+  if (!req.user || !roles.includes(req.user.role)) {
+    return res.status(403).json({ error: 'Accès interdit' });
+  }
+  next();
 };
 
 // Login Function
@@ -272,13 +227,6 @@ export const securityMiddleware = [
         objectSrc: ["'none'"],
         upgradeInsecureRequests: []
       }
-    },
-    xssFilter: true,
-    noSniff: true,
-    referrerPolicy: { policy: 'same-origin' },
-    hsts: {
-      maxAge: 15552000,  // 180 days
-      includeSubDomains: true
     }
   }),
   cookieParser()
@@ -302,30 +250,6 @@ function generateRefreshToken(user) {
 }
 
 export const hashPassword = async (password) => {
-  const salt = await bcrypt.genSalt(12); // Increased from 10 to 12 for better security
+  const salt = await bcrypt.genSalt(12);
   return bcrypt.hash(password, salt);
-};
-
-export const generateRandomPassword = (length = 16) => { // Increased from 12 to 16
-  const upperChars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  const lowerChars = 'abcdefghijklmnopqrstuvwxyz';
-  const numbers = '0123456789';
-  const specialChars = '!@#$%^&*()-_=+[]{}|;:,.<>?';
-  
-  const allChars = upperChars + lowerChars + numbers + specialChars;
-  
-  let password = '';
-  // Ensure at least one of each character type
-  password += upperChars.charAt(Math.floor(Math.random() * upperChars.length));
-  password += lowerChars.charAt(Math.floor(Math.random() * lowerChars.length));
-  password += numbers.charAt(Math.floor(Math.random() * numbers.length));
-  password += specialChars.charAt(Math.floor(Math.random() * specialChars.length));
-  
-  // Fill the rest randomly
-  for (let i = 4; i < length; i++) {
-    password += allChars.charAt(Math.floor(Math.random() * allChars.length));
-  }
-  
-  // Shuffle the password characters
-  return password.split('').sort(() => 0.5 - Math.random()).join('');
 };

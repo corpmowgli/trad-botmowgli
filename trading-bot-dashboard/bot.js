@@ -1,77 +1,68 @@
-// bot.js - Optimized version
+//bot.js
+// bot.js - Optimized Trading Bot
 import { tradingConfig } from './config/tradingConfig.js';
-import { EnhancedMomentumStrategy } from './strategies/enhancedMomentumStrategy.js';
+import { TradingStrategy } from './strategies/tradingStrategy.js';
 import { MarketDataService } from './services/marketDataService.js';
 import { RiskManager } from './trading/riskManager.js';
 import { PositionManager } from './trading/positionManager.js';
 import { PortfolioManager } from './trading/portfolioManager.js';
 import { TradeLogger } from './trading/tradeLogger.js';
-import { TradingVisualizer } from './utils/tradingVisualizer.js';
-import { SimulationEngine } from './trading/simulationEngine.js';
 import { retry, delay, generateUUID } from './utils/helpers.js';
 import EventEmitter from 'events';
 
 /**
- * Classe principale du bot de trading
- * Gère l'orchestration des différents composants du système
+ * Trading Bot Core Class
+ * Orchestrates all trading system components
  */
 export class TradingBot extends EventEmitter {
   /**
-   * Constructeur de la classe TradingBot
-   * @param {Object} customConfig - Configuration personnalisée (optionnelle)
+   * Create a new TradingBot instance
+   * @param {Object} customConfig - Custom configuration (optional)
    */
   constructor(customConfig = {}) {
     super();
     
-    // Fusionner la configuration personnalisée avec la configuration par défaut
+    // Configuration
     this.config = { ...tradingConfig, ...customConfig };
     
-    // Initialiser les composants du système
-    this.strategy = new EnhancedMomentumStrategy(this.config);
+    // System components
+    this.strategy = new TradingStrategy(this.config);
     this.marketData = new MarketDataService(this.config);
     this.riskManager = new RiskManager(this.config);
     this.positionManager = new PositionManager(this.config);
     this.portfolioManager = new PortfolioManager(this.config.simulation.initialCapital);
     this.logger = new TradeLogger(this.config);
-    this.visualizer = new TradingVisualizer(this.logger);
     
-    // État du bot
-    this.isRunning = false;
-    this.isStopping = false;
-    this.consecutiveErrors = 0;
-    this.lastCycleTime = null;
-    this.startTime = null;
-    this.processingStatus = {
-      isProcessingCycle: false,
+    // Consolidated state
+    this.state = {
+      isRunning: false,
+      isStopping: false,
+      consecutiveErrors: 0,
+      startTime: null,
       lastCycleTime: null,
       cycleCount: 0,
       successfulCycles: 0,
-      failedCycles: 0
+      failedCycles: 0,
+      isProcessingCycle: false
     };
     
-    // Cache pour optimiser les performances
-    this.dataCache = new Map(); // Cache pour les réponses API
-    this.tokenCache = new Map(); // Cache pour les tokens qualifiés
-    this.priceCache = new Map(); // Cache pour les prix actuels
-    
-    // Identifiants des intervalles pour le nettoyage
+    // Interval IDs for cleanup
     this.intervals = {
       mainLoop: null,
       statusUpdate: null,
-      cleanupTask: null,
-      dataCacheCleanup: null
+      cleanupTask: null
     };
     
-    // Initialiser la journalisation
+    // Initialize logging
     this._initializeLogging();
   }
 
   /**
-   * Initialise la journalisation du bot
+   * Initialize event logging
    * @private
    */
   _initializeLogging() {
-    // Configurer les écouteurs d'événements pour la journalisation
+    // Configure event listeners for logging
     this.on('trade', (trade) => {
       console.log(`[Bot] Trade executed: ${trade.token} - Profit: ${trade.profit}`);
     });
@@ -98,114 +89,107 @@ export class TradingBot extends EventEmitter {
   }
 
   /**
-   * Démarre le bot de trading
-   * @returns {Promise<boolean>} True si le démarrage réussit
+   * Start the trading bot
+   * @returns {Promise<boolean>} True if startup succeeds
    */
   async start() {
-    // Vérifier si le bot est déjà en cours d'exécution
-    if (this.isRunning) {
+    if (this.state.isRunning) {
       this.emit('warning', 'Bot is already running');
       return false;
     }
     
     try {
-      this.isRunning = true;
-      this.isStopping = false;
-      this.startTime = Date.now();
-      this.consecutiveErrors = 0;
-      this.emit('info', `Trading bot started at ${new Date(this.startTime).toISOString()}`);
+      this.state.isRunning = true;
+      this.state.isStopping = false;
+      this.state.startTime = Date.now();
+      this.state.consecutiveErrors = 0;
+      this.emit('info', `Trading bot started at ${new Date(this.state.startTime).toISOString()}`);
       
-      // Configurer l'intervalle pour le cycle de trading principal
-      const cycleInterval = this.config.trading.cycleInterval || 60000; // Défaut: 1 minute
+      // Set up the main trading cycle interval
+      const cycleInterval = this.config.trading.cycleInterval || 60000; // Default: 1 minute
       this.intervals.mainLoop = setInterval(() => this.runTradingCycle(), cycleInterval);
       
-      // Configurer l'intervalle pour les mises à jour d'état
+      // Set up status update interval
       this.intervals.statusUpdate = setInterval(() => this.emitStatusUpdate(), 30000);
       
-      // Configurer l'intervalle pour les tâches de nettoyage (une fois par jour)
+      // Set up cleanup task interval (once a day)
       this.intervals.cleanupTask = setInterval(() => this.performCleanupTasks(), 24 * 60 * 60 * 1000);
       
-      // Configurer le nettoyage du cache de données (toutes les 10 minutes)
-      this.intervals.dataCacheCleanup = setInterval(() => this.cleanupDataCache(), 10 * 60 * 1000);
-      
-      // Exécuter immédiatement le premier cycle
+      // Run the first cycle immediately
       this.runTradingCycle();
       
       return true;
     } catch (error) {
-      this.isRunning = false;
+      this.state.isRunning = false;
       this.emit('error', error);
       return false;
     }
   }
   
   /**
-   * Arrête le bot de trading
-   * @returns {Promise<Object>} Rapport de performance final
+   * Stop the trading bot
+   * @returns {Promise<Object>} Final performance report
    */
   async stop() {
-    if (!this.isRunning) {
+    if (!this.state.isRunning) {
       this.emit('warning', 'Bot is not running');
       return this.getPerformanceReport();
     }
     
     try {
-      this.isStopping = true;
+      this.state.isStopping = true;
       this.emit('info', 'Stopping trading bot...');
       
-      // Nettoyer les intervalles
-      for (const [key, interval] of Object.entries(this.intervals)) {
-        if (interval) {
-          clearInterval(interval);
-          this.intervals[key] = null;
-        }
-      }
+      // Clear all intervals
+      Object.values(this.intervals).forEach(interval => {
+        if (interval) clearInterval(interval);
+      });
       
-      // Fermer toutes les positions ouvertes si configuré
+      // Close all open positions if configured
       if (this.config.trading.closePositionsOnStop) {
         await this.closeAllPositions();
       }
       
-      // Générer le rapport final
+      // Generate final report
       const report = this.generateConsoleReport();
       console.log(report);
       
-      // Nettoyer les ressources
+      // Cleanup resources
       this.logger.cleanup();
       
-      this.isRunning = false;
-      this.isStopping = false;
+      this.state.isRunning = false;
+      this.state.isStopping = false;
       this.emit('info', `Trading bot stopped. Total runtime: ${this._calculateRuntime()}`);
       
       return this.getPerformanceReport();
     } catch (error) {
       this.emit('error', error);
-      this.isRunning = false;
-      this.isStopping = false;
+      this.state.isRunning = false;
+      this.state.isStopping = false;
       return this.getPerformanceReport();
     }
   }
   
   /**
-   * Exécute un cycle de trading complet
-   * @returns {Promise<boolean>} true si le cycle a réussi
+   * Run a complete trading cycle
+   * @returns {Promise<boolean>} True if cycle succeeds
    */
   async runTradingCycle() {
-    // Éviter l'exécution simultanée de plusieurs cycles
-    if (this.processingStatus.isProcessingCycle) {
-      this.emit('debug', 'Trading cycle already in progress, skipping this cycle');
+    // Avoid running multiple cycles simultaneously
+    if (this.state.isProcessingCycle) {
+      this.emit('debug', 'Trading cycle already in progress, skipping');
       return false;
     }
     
-    // Marquer le début du cycle
-    this.processingStatus.isProcessingCycle = true;
-    this.processingStatus.lastCycleTime = Date.now();
-    this.processingStatus.cycleCount++;
+    // Mark cycle start
+    this.state.isProcessingCycle = true;
+    this.state.lastCycleTime = Date.now();
+    this.state.cycleCount++;
     
     try {
-      this.emit('debug', `Starting trading cycle #${this.processingStatus.cycleCount}`);
+      this.emit('debug', `Starting trading cycle #${this.state.cycleCount}`);
       
-      // Étape 1: Obtenir les tokens qualifiés
+      // Step 1: Get qualified tokens
       const tokens = await retry(
         () => this.getQualifiedTokens(),
         3,
@@ -218,87 +202,72 @@ export class TradingBot extends EventEmitter {
       } else {
         this.emit('debug', `Found ${tokens.length} qualified tokens`);
         
-        // Étape 2: Traiter les tokens avec un peu de parallélisme (limite à 3 tokens simultanés)
-        const batchSize = 3;
-        for (let i = 0; i < tokens.length; i += batchSize) {
-          const tokenBatch = tokens.slice(i, i + batchSize);
+        // Step 2: Process each token sequentially
+        for (const token of tokens) {
+          if (this.state.isStopping) break;
           
-          // Traiter chaque lot en parallèle
-          await Promise.all(
-            tokenBatch.map(async (token) => {
-              // Vérifier si le bot est en cours d'arrêt
-              if (this.isStopping) return;
-              
-              await this.processToken(token);
-            })
-          );
-          
-          // Petite pause entre les lots pour éviter de surcharger les API
-          if (i + batchSize < tokens.length) {
-            await delay(1000);
-          }
+          await this.processToken(token);
+          await delay(500); // Small pause between tokens
         }
       }
       
-      // Étape 3: Vérifier et fermer les positions qui ont atteint leurs objectifs
+      // Step 3: Check and close positions that have reached their targets
       await this.checkAndClosePositions();
       
-      this.processingStatus.successfulCycles++;
-      this.consecutiveErrors = 0;
-      this.emit('debug', `Completed trading cycle #${this.processingStatus.cycleCount}`);
+      this.state.successfulCycles++;
+      this.state.consecutiveErrors = 0;
+      this.emit('debug', `Completed trading cycle #${this.state.cycleCount}`);
       
       return true;
     } catch (error) {
-      this.processingStatus.failedCycles++;
-      this.consecutiveErrors++;
+      this.state.failedCycles++;
+      this.state.consecutiveErrors++;
       this.emit('error', error);
       
-      // Vérifier si le nombre d'erreurs consécutives dépasse le seuil configuré
-      if (this.consecutiveErrors >= this.config.errorHandling.maxConsecutiveErrors) {
-        this.emit('warning', `Too many consecutive errors (${this.consecutiveErrors}), activating circuit breaker`);
-        
-        // Activer le disjoncteur
+      // Check for too many consecutive errors
+      if (this.state.consecutiveErrors >= this.config.errorHandling.maxConsecutiveErrors) {
+        this.emit('warning', `Too many consecutive errors (${this.state.consecutiveErrors}), activating circuit breaker`);
         this._activateCircuitBreaker();
       }
       
       return false;
     } finally {
-      // Marquer la fin du cycle
-      this.processingStatus.isProcessingCycle = false;
+      // Mark cycle end
+      this.state.isProcessingCycle = false;
     }
   }
   
   /**
-   * Traite un token spécifique pour l'analyse et le trading potentiel
-   * @param {Object} token - Informations du token
-   * @returns {Promise<Object|null>} Position ouverte ou null
+   * Process a specific token for analysis and potential trading
+   * @param {Object} token - Token information
+   * @returns {Promise<Object|null>} Opened position or null
    */
   async processToken(token) {
     try {
-      // Vérifier si nous avons déjà une position pour ce token
+      // Check if we already have a position for this token
       const openPositions = this.positionManager.getOpenPositions();
       if (openPositions.some(p => p.token === token.token_mint)) {
         this.emit('debug', `Already have a position for ${token.token_mint}, skipping`);
         return null;
       }
       
-      // Obtenir les données de marché agrégées
+      // Get aggregated market data
       const marketData = await this.marketData.aggregateTokenData(token.token_mint);
       
-      // Obtenir les données historiques
+      // Get historical data
       const historicalData = await this.getHistoricalData(token.token_mint);
       
-      // Vérifier si nous avons suffisamment de données
+      // Check if we have enough data
       if (!historicalData || historicalData.length < this.config.indicators.minimumDataPoints) {
         this.emit('debug', `Insufficient historical data for ${token.token_mint}`);
         return null;
       }
       
-      // Préparer les données pour l'analyse
+      // Prepare data for analysis
       const prices = historicalData.map(data => data.price);
       const volumes = historicalData.map(data => data.volume);
       
-      // Analyser avec la stratégie de trading
+      // Analyze with trading strategy
       const signal = await this.strategy.analyze(
         token.token_mint,
         prices, 
@@ -306,23 +275,23 @@ export class TradingBot extends EventEmitter {
         marketData
       );
       
-      // Vérifier si le signal est valide et si nous pouvons trader selon la gestion des risques
+      // Check if signal is valid and if we can trade based on risk management
       if (signal.type === 'NONE' || signal.confidence < this.config.trading.minConfidenceThreshold) {
         this.emit('debug', `No valid signal for ${token.token_mint} (Confidence: ${signal.confidence})`);
         return null;
       }
       
-      // Vérifier si nous pouvons trader selon la gestion des risques
+      // Check if we can trade according to risk management
       if (!this.riskManager.canTrade(this.portfolioManager)) {
         this.emit('info', `Risk management prevents trading for ${token.token_mint}`);
         return null;
       }
       
-      // Calculer la taille de la position
+      // Calculate position size
       const price = prices[prices.length - 1];
       const amount = this.riskManager.calculatePositionSize(price, this.portfolioManager);
       
-      // Ouvrir une nouvelle position avec les informations du signal
+      // Open a new position with signal information
       const position = await this.openNewPosition(token.token_mint, price, amount, signal);
       
       return position;
@@ -333,30 +302,30 @@ export class TradingBot extends EventEmitter {
   }
 
   /**
-   * Vérifie et ferme les positions qui ont atteint leurs objectifs
-   * @returns {Promise<Array>} Positions fermées
+   * Check and close positions that have reached their targets
+   * @returns {Promise<Array>} Closed positions
    */
   async checkAndClosePositions() {
     try {
-      // Récupérer les prix actuels pour toutes les positions
+      // Get current prices for all positions
       const currentPrices = await this.fetchCurrentPrices();
       
-      // Vérifier les positions avec les prix actuels
+      // Check positions with current prices
       const closedPositions = await this.positionManager.checkPositions(currentPrices);
       
-      // Traiter les positions fermées
+      // Process closed positions
       for (const position of closedPositions) {
-        // Mettre à jour le portfolio
+        // Update portfolio
         this.portfolioManager.updatePortfolio(position);
         
-        // Journaliser le trade avec les informations supplémentaires du signal
+        // Log the trade with additional signal information
         const tradeLog = this.logger.logTrade({
           ...position,
           signalConfidence: position.signalConfidence || 0,
           signalReasons: position.signalReasons || []
         });
         
-        // Émettre l'événement de trade
+        // Emit trade event
         this.emit('trade', tradeLog);
       }
       
@@ -372,33 +341,33 @@ export class TradingBot extends EventEmitter {
   }
 
   /**
-   * Ouvre une nouvelle position
-   * @param {string} token - Token à trader
-   * @param {number} price - Prix d'entrée
-   * @param {number} amount - Montant à trader
-   * @param {Object} signal - Signal de trading
-   * @returns {Promise<Object|null>} Position ouverte ou null
+   * Open a new position
+   * @param {string} token - Token to trade
+   * @param {number} price - Entry price
+   * @param {number} amount - Amount to trade
+   * @param {Object} signal - Trading signal
+   * @returns {Promise<Object|null>} Opened position or null
    */
   async openNewPosition(token, price, amount, signal) {
     try {
-      // Vérifier que les paramètres d'entrée sont valides
+      // Validate input parameters
       if (!token || !price || !amount || price <= 0 || amount <= 0) {
         this.emit('warning', `Invalid parameters for opening position: token=${token}, price=${price}, amount=${amount}`);
         return null;
       }
       
-      // Vérifier si le nombre maximum de positions est atteint
+      // Check if maximum number of positions is reached
       const openPositions = this.positionManager.getOpenPositions();
       if (openPositions.length >= this.config.trading.maxOpenPositions) {
         this.emit('info', `Maximum number of open positions (${this.config.trading.maxOpenPositions}) reached`);
         return null;
       }
       
-      // Ouvrir la position
+      // Open the position
       const position = await this.positionManager.openPosition(token, price, amount);
       
       if (position) {
-        // Stocker les informations du signal dans la position pour la journalisation
+        // Store signal information in the position for logging
         position.signalConfidence = signal.confidence;
         position.signalReasons = signal.reasons;
         position.signal = signal.type;
@@ -417,8 +386,8 @@ export class TradingBot extends EventEmitter {
   }
 
   /**
-   * Ferme toutes les positions ouvertes
-   * @returns {Promise<Array>} Positions fermées
+   * Close all open positions
+   * @returns {Promise<Array>} Closed positions
    */
   async closeAllPositions() {
     try {
@@ -431,12 +400,12 @@ export class TradingBot extends EventEmitter {
       
       this.emit('info', `Closing all ${positions.length} open positions`);
       
-      // Récupérer les prix actuels
+      // Get current prices
       const currentPrices = await this.fetchCurrentPrices();
       
       const closedPositions = [];
       
-      // Fermer manuellement chaque position
+      // Manually close each position
       for (const position of positions) {
         const price = currentPrices.get(position.token) || position.entryPrice;
         
@@ -451,13 +420,13 @@ export class TradingBot extends EventEmitter {
             closeReason: 'MANUAL_CLOSE'
           };
           
-          // Mettre à jour le portfolio
+          // Update portfolio
           this.portfolioManager.updatePortfolio(closedPosition);
           
-          // Journaliser le trade
+          // Log the trade
           this.logger.logTrade(closedPosition);
           
-          // Émettre l'événement de trade
+          // Emit trade event
           this.emit('trade', closedPosition);
           
           closedPositions.push(closedPosition);
@@ -466,7 +435,7 @@ export class TradingBot extends EventEmitter {
         }
       }
       
-      // Effacer toutes les positions du gestionnaire
+      // Clear all positions
       this.positionManager.clearPositions();
       
       return closedPositions;
@@ -477,83 +446,32 @@ export class TradingBot extends EventEmitter {
   }
 
   /**
-   * Récupère les prix actuels pour tous les tokens dans les positions avec cache
-   * @returns {Promise<Map>} Map des prix actuels (token -> prix)
+   * Get current prices for all tokens in positions
+   * @returns {Promise<Map>} Map of current prices (token -> price)
    */
   async fetchCurrentPrices() {
     const positions = this.positionManager.getOpenPositions();
     const prices = new Map();
     
-    // Créer une liste des tokens à vérifier
-    const tokens = positions.map(p => p.token);
-    
-    // Vérifier le cache pour les prix récents (moins de 30 secondes)
-    let tokensToFetch = [];
-    for (const token of tokens) {
-      const cachedPrice = this.priceCache.get(token);
-      if (cachedPrice && (Date.now() - cachedPrice.timestamp < 30000)) {
-        prices.set(token, cachedPrice.price);
-      } else {
-        tokensToFetch.push(token);
-      }
-    }
-    
-    // Si des tokens ont besoin d'être récupérés, les récupérer en lot si possible
-    if (tokensToFetch.length > 0) {
+    for (const position of positions) {
       try {
-        // Essayer d'abord une récupération par lots
-        const batchPrices = await retry(
-          () => this.marketData.getBatchTokenPrices(tokensToFetch),
-          3, 
+        const price = await retry(
+          () => this.marketData.getTokenPrice(position.token),
+          3,
           1000
         );
         
-        if (batchPrices) {
-          // Mettre à jour les prix et le cache
-          for (const [token, price] of Object.entries(batchPrices)) {
-            if (price) {
-              prices.set(token, price);
-              this.priceCache.set(token, {
-                price,
-                timestamp: Date.now()
-              });
-            }
-          }
-          
-          // Vérifier s'il manque des tokens
-          tokensToFetch = tokensToFetch.filter(token => !prices.has(token));
+        if (price) {
+          prices.set(position.token, price);
+        } else {
+          // If price is unavailable, use entry price as fallback
+          prices.set(position.token, position.entryPrice);
+          this.emit('warning', `Could not fetch current price for ${position.token}, using entry price`);
         }
       } catch (error) {
-        this.emit('warning', `Batch price fetch failed, falling back to individual requests: ${error.message}`);
-      }
-      
-      // Récupérer individuellement les prix manquants
-      for (const token of tokensToFetch) {
-        try {
-          const price = await retry(
-            () => this.marketData.getTokenPrice(token),
-            3,
-            1000
-          );
-          
-          if (price) {
-            prices.set(token, price);
-            this.priceCache.set(token, {
-              price,
-              timestamp: Date.now()
-            });
-          } else {
-            // Si le prix n'est pas disponible, utiliser le prix d'entrée comme fallback
-            const position = positions.find(p => p.token === token);
-            prices.set(token, position.entryPrice);
-            this.emit('warning', `Could not fetch current price for ${token}, using entry price`);
-          }
-        } catch (error) {
-          this.emit('error', new Error(`Error fetching price for ${token}: ${error.message}`));
-          // Utiliser le prix d'entrée comme fallback
-          const position = positions.find(p => p.token === token);
-          prices.set(token, position.entryPrice);
-        }
+        this.emit('error', new Error(`Error fetching price for ${position.token}: ${error.message}`));
+        // Use entry price as fallback
+        prices.set(position.token, position.entryPrice);
       }
     }
     
@@ -561,40 +479,26 @@ export class TradingBot extends EventEmitter {
   }
 
   /**
-   * Récupère les tokens qualifiés selon les critères configurés avec cache
-   * @returns {Promise<Array>} Liste des tokens qualifiés
+   * Get qualified tokens according to configured criteria
+   * @returns {Promise<Array>} List of qualified tokens
    */
   async getQualifiedTokens() {
     try {
-      // Vérifier si nous avons un cache valide (moins de 10 minutes)
-      const cachedTokens = this.tokenCache.get('qualified_tokens');
-      if (cachedTokens && (Date.now() - cachedTokens.timestamp < 10 * 60 * 1000)) {
-        return cachedTokens.data;
-      }
-      
       const response = await this.marketData.getQualifiedTokens(
         this.config.trading.minLiquidity,
         this.config.trading.minVolume24h
       );
       
-      // Valider et filtrer la réponse
+      // Validate and filter response
       if (!response || !Array.isArray(response)) {
         this.emit('warning', 'Invalid response from getQualifiedTokens');
         return [];
       }
       
-      // Filtrer les tokens invalides
-      const validTokens = response.filter(token => 
+      // Filter out invalid tokens
+      return response.filter(token => 
         token && token.token_mint && typeof token.token_mint === 'string'
       );
-      
-      // Mettre à jour le cache
-      this.tokenCache.set('qualified_tokens', {
-        data: validTokens,
-        timestamp: Date.now()
-      });
-      
-      return validTokens;
     } catch (error) {
       this.emit('error', new Error(`Error getting qualified tokens: ${error.message}`));
       return [];
@@ -602,68 +506,51 @@ export class TradingBot extends EventEmitter {
   }
   
   /**
-   * Récupère les données historiques pour un token spécifique avec cache
-   * @param {string} tokenMint - Adresse du token
-   * @param {number} lookbackPeriod - Période de recul en heures (défaut: 50)
-   * @returns {Promise<Array>} Données historiques
+   * Get historical data for a specific token
+   * @param {string} tokenMint - Token address
+   * @param {number} lookbackPeriod - Lookback period in hours (default: 50)
+   * @returns {Promise<Array>} Historical data
    */
   async getHistoricalData(tokenMint, lookbackPeriod = 50) {
     try {
-      // Créer une clé de cache incluant le token et la période de recul
-      const cacheKey = `historical_${tokenMint}_${lookbackPeriod}`;
-      
-      // Vérifier si nous avons des données en cache et qu'elles ne sont pas périmées
-      const cachedData = this.dataCache.get(cacheKey);
-      if (cachedData && (Date.now() - cachedData.timestamp < 5 * 60 * 1000)) { // cache de 5 minutes
-        return cachedData.data;
-      }
-      
-      // Valider les paramètres
+      // Validate parameters
       if (!tokenMint || typeof tokenMint !== 'string') {
         this.emit('warning', `Invalid tokenMint parameter: ${tokenMint}`);
         return [];
       }
       
       if (lookbackPeriod <= 0) {
-        lookbackPeriod = 50; // Valeur par défaut
+        lookbackPeriod = 50; // Default value
       }
       
-      // Calculer les timestamps
+      // Calculate timestamps
       const endTime = Date.now();
-      const startTime = endTime - (lookbackPeriod * 3600 * 1000); // lookbackPeriod en heures
+      const startTime = endTime - (lookbackPeriod * 3600 * 1000); // lookbackPeriod in hours
       
       const response = await retry(
         () => this.marketData.getHistoricalPrices(
           tokenMint,
           startTime,
           endTime,
-          '1h' // Intervalles de 1 heure
+          '1h' // 1-hour intervals
         ),
         3,
         1000
       );
       
-      // Valider la réponse
+      // Validate response
       if (!response || !Array.isArray(response)) {
         this.emit('warning', `Invalid historical data response for ${tokenMint}`);
         return [];
       }
       
-      // Filtrer et valider les données
-      const validData = response.filter(item => 
+      // Filter and validate data
+      return response.filter(item => 
         item && 
         typeof item.price === 'number' && 
         typeof item.volume === 'number' && 
         typeof item.timestamp === 'number'
       );
-      
-      // Mettre à jour le cache
-      this.dataCache.set(cacheKey, {
-        data: validData,
-        timestamp: Date.now()
-      });
-      
-      return validData;
     } catch (error) {
       this.emit('error', new Error(`Error getting historical data for ${tokenMint}: ${error.message}`));
       return [];
@@ -671,14 +558,13 @@ export class TradingBot extends EventEmitter {
   }
   
   /**
-   * Exécute une simulation de backtest
-   * @param {Date|string|number} startDate - Date de début
-   * @param {Date|string|number} endDate - Date de fin
-   * @param {Object} customConfig - Configuration personnalisée pour la simulation
-   * @returns {Promise<Object>} Résultats de la simulation
+   * Run a backtest simulation
+   * @param {Date|string|number} startDate - Start date
+   * @param {Date|string|number} endDate - End date
+   * @returns {Promise<Object>} Simulation results
    */
-  async runSimulation(startDate, endDate, customConfig = {}) {
-    if (this.isRunning) {
+  async runSimulation(startDate, endDate) {
+    if (this.state.isRunning) {
       this.emit('warning', 'Cannot run simulation while bot is running');
       return {
         success: false,
@@ -686,26 +572,157 @@ export class TradingBot extends EventEmitter {
       };
     }
     
+    this.emit('info', `Starting simulation from ${new Date(startDate).toISOString()} to ${new Date(endDate).toISOString()}`);
+    
+    const simulationResult = {
+      success: true,
+      startDate: new Date(startDate).toISOString(),
+      endDate: new Date(endDate).toISOString(),
+      trades: [],
+      metrics: {
+        totalTrades: 0,
+        winningTrades: 0,
+        losingTrades: 0,
+        totalProfit: 0,
+        winRate: 0,
+        maxDrawdown: 0,
+        profitFactor: 0,
+        sharpeRatio: 0
+      }
+    };
+    
     try {
-      this.emit('info', `Starting simulation from ${new Date(startDate).toISOString()} to ${new Date(endDate).toISOString()}`);
+      // Reset portfolio for simulation
+      const initialCapital = this.config.simulation.initialCapital;
+      const simulationPortfolio = new PortfolioManager(initialCapital);
       
-      // Créer le moteur de simulation si nécessaire
-      if (!this.simulationEngine) {
-        this.simulationEngine = new SimulationEngine(
-          this.marketData,
-          this.strategy,
-          this.riskManager,
-          { ...this.config, ...customConfig }
-        );
+      // Get qualified tokens for simulation
+      const tokens = await this.getQualifiedTokens();
+      
+      if (!tokens || tokens.length === 0) {
+        throw new Error('No qualified tokens found for simulation');
       }
       
-      // Exécuter la simulation
-      const simulationResult = await this.simulationEngine.runSimulation(
-        startDate,
-        endDate
-      );
+      this.emit('info', `Running simulation on ${tokens.length} qualified tokens`);
       
-      this.emit('info', `Simulation completed with ${simulationResult.trades.length} trades`);
+      // Variables for drawdown and Sharpe ratio
+      let peakCapital = initialCapital;
+      let maxDrawdown = 0;
+      let dailyReturns = [];
+      let currentCapital = initialCapital;
+      
+      // Process each token
+      for (const token of tokens) {
+        // Get complete historical data for the backtest period
+        const historicalData = await this.getHistoricalData(
+          token.token_mint,
+          this._calculateHoursBetween(startDate, endDate)
+        );
+        
+        // Ensure we have sufficient data for analysis
+        if (!historicalData || historicalData.length < 50) {
+          this.emit('debug', `Insufficient historical data for ${token.token_mint}, skipping`);
+          continue;
+        }
+        
+        this.emit('debug', `Processing token ${token.token_mint} with ${historicalData.length} data points`);
+        
+        // Simulate trading for each trading window
+        for (let i = 50; i < historicalData.length; i++) {
+          // Get window data for analysis
+          const windowData = historicalData.slice(i - 50, i);
+          const prices = windowData.map(d => d.price);
+          const volumes = windowData.map(d => d.volume);
+          
+          // Get market metrics for current window
+          const marketData = {
+            liquidity: token.liquidity || 0,
+            volume24h: token.volume24h || 0,
+            priceChange24h: ((prices[prices.length - 1] - prices[prices.length - 25]) / prices[prices.length - 25]) * 100,
+            marketCap: token.marketCap || 0,
+            fullyDilutedValuation: token.fdv || 0
+          };
+          
+          // Analyze with strategy
+          const signal = await this.strategy.analyze(
+            token.token_mint,
+            prices,
+            volumes,
+            marketData
+          );
+          
+          // If we have a valid signal, simulate a trade
+          if (signal.type !== 'NONE' && signal.confidence >= this.config.trading.minConfidenceThreshold) {
+            const trade = this.simulateTrade(
+              token.token_mint,
+              historicalData[i],
+              historicalData.slice(i),
+              signal,
+              simulationPortfolio
+            );
+            
+            if (trade) {
+              simulationResult.trades.push(trade);
+              
+              // Update metrics
+              this.updateSimulationMetrics(simulationResult.metrics, trade);
+              
+              // Update capital for drawdown calculation
+              currentCapital += trade.profit;
+              
+              // Update peak capital if necessary
+              if (currentCapital > peakCapital) {
+                peakCapital = currentCapital;
+              }
+              
+              // Calculate current drawdown
+              const currentDrawdown = ((peakCapital - currentCapital) / peakCapital) * 100;
+              maxDrawdown = Math.max(maxDrawdown, currentDrawdown);
+              
+              // Record daily return for Sharpe ratio
+              const dateKey = new Date(trade.timestamp).toISOString().split('T')[0];
+              dailyReturns.push({
+                date: dateKey,
+                return: (trade.profit / initialCapital) * 100
+              });
+            }
+          }
+        }
+      }
+      
+      // Calculate final metrics
+      if (simulationResult.metrics.totalTrades > 0) {
+        // Win rate
+        simulationResult.metrics.winRate = 
+          (simulationResult.metrics.winningTrades / simulationResult.metrics.totalTrades) * 100;
+        
+        // Max drawdown
+        simulationResult.metrics.maxDrawdown = maxDrawdown;
+        
+        // Profit factor
+        const totalGain = simulationResult.trades
+          .filter(t => t.profit > 0)
+          .reduce((sum, t) => sum + t.profit, 0);
+        
+        const totalLoss = Math.abs(simulationResult.trades
+          .filter(t => t.profit < 0)
+          .reduce((sum, t) => sum + t.profit, 0));
+        
+        simulationResult.metrics.profitFactor = totalLoss > 0 ? totalGain / totalLoss : totalGain > 0 ? Infinity : 0;
+        
+        // Sharpe ratio (simplified)
+        if (dailyReturns.length > 1) {
+          const returns = dailyReturns.map(d => d.return);
+          const avgReturn = returns.reduce((sum, r) => sum + r, 0) / returns.length;
+          const stdDev = Math.sqrt(
+            returns.reduce((sum, r) => sum + Math.pow(r - avgReturn, 2), 0) / returns.length
+          );
+          
+          simulationResult.metrics.sharpeRatio = stdDev > 0 ? avgReturn / stdDev : 0;
+        }
+      }
+      
+      this.emit('info', `Simulation completed with ${simulationResult.metrics.totalTrades} trades`);
       
       return simulationResult;
     } catch (error) {
@@ -721,8 +738,134 @@ export class TradingBot extends EventEmitter {
   }
   
   /**
-   * Obtient un rapport de performance complet
-   * @returns {Object} Rapport de performance
+   * Simulate a trade based on historical data
+   * @param {string} tokenMint - Token address
+   * @param {Object} entryData - Entry data
+   * @param {Array} futureData - Future data for simulation
+   * @param {Object} signal - Trading signal
+   * @param {Object} portfolio - Simulated portfolio
+   * @returns {Object|null} Simulated trade or null
+   */
+  simulateTrade(tokenMint, entryData, futureData, signal, portfolio) {
+    try {
+      // Validate inputs
+      if (!tokenMint || !entryData || !entryData.price || !futureData || futureData.length < 2) {
+        return null;
+      }
+      
+      // Calculate position size based on portfolio and risk management
+      const positionSize = this.riskManager.calculatePositionSize(
+        entryData.price,
+        portfolio
+      );
+      
+      // Define exit conditions (stop loss and take profit)
+      const stopLoss = entryData.price * (1 - (this.config.trading.stopLoss / 100));
+      const takeProfit = entryData.price * (1 + (this.config.trading.takeProfit / 100));
+      
+      // Find exit point in future data
+      let exitData = null;
+      let holdingTime = 0;
+      let exitReason = 'TIMEOUT';
+      
+      // Loop through future data (limited to 48 hours max)
+      for (let i = 1; i < futureData.length && i < 48; i++) {
+        const currentPrice = futureData[i].price;
+        holdingTime = futureData[i].timestamp - entryData.timestamp;
+        
+        // Check if stop loss or take profit is reached
+        if (currentPrice <= stopLoss) {
+          exitData = futureData[i];
+          exitReason = 'STOP_LOSS';
+          break;
+        }
+        
+        if (currentPrice >= takeProfit) {
+          exitData = futureData[i];
+          exitReason = 'TAKE_PROFIT';
+          break;
+        }
+        
+        // Maximum holding period (24 hours by default)
+        const maxHoldingHours = this.config.simulation.maxHoldingPeriodHours || 24;
+        if (holdingTime >= maxHoldingHours * 60 * 60 * 1000) {
+          exitData = futureData[i];
+          exitReason = 'MAX_HOLDING_TIME';
+          break;
+        }
+      }
+      
+      // If no exit point found, use the last available data point
+      if (!exitData && futureData.length > 1) {
+        exitData = futureData[Math.min(24, futureData.length - 1)];
+        holdingTime = exitData.timestamp - entryData.timestamp;
+        exitReason = 'END_OF_DATA';
+      } else if (!exitData) {
+        // Not enough future data to simulate exit
+        return null;
+      }
+      
+      // Calculate profit
+      const profit = (exitData.price - entryData.price) * positionSize;
+      
+      // Update simulated portfolio
+      portfolio.updatePortfolio({
+        token: tokenMint,
+        entryPrice: entryData.price,
+        exitPrice: exitData.price,
+        amount: positionSize,
+        profit,
+        timestamp: entryData.timestamp,
+        holdingTime,
+        signal: signal.type
+      });
+      
+      // Return the simulated trade
+      return {
+        id: generateUUID(),
+        token: tokenMint,
+        entryPrice: entryData.price,
+        exitPrice: exitData.price,
+        amount: positionSize,
+        profit,
+        profitPercentage: ((exitData.price - entryData.price) / entryData.price) * 100,
+        timestamp: entryData.timestamp,
+        exitTimestamp: exitData.timestamp,
+        holdingTime,
+        signal: signal.type,
+        signalConfidence: signal.confidence,
+        signalReasons: signal.reasons,
+        stopLoss,
+        takeProfit,
+        exitReason
+      };
+    } catch (error) {
+      this.emit('error', new Error(`Error simulating trade for ${tokenMint}: ${error.message}`));
+      return null;
+    }
+  }
+  
+  /**
+   * Update simulation metrics with trade data
+   * @param {Object} metrics - Metrics to update
+   * @param {Object} trade - Trade data
+   */
+  updateSimulationMetrics(metrics, trade) {
+    if (!metrics || !trade) return;
+    
+    metrics.totalTrades++;
+    metrics.totalProfit += trade.profit;
+    
+    if (trade.profit > 0) {
+      metrics.winningTrades++;
+    } else {
+      metrics.losingTrades++;
+    }
+  }
+  
+  /**
+   * Get a complete performance report
+   * @returns {Object} Performance report
    */
   getPerformanceReport() {
     return {
@@ -732,109 +875,48 @@ export class TradingBot extends EventEmitter {
       portfolioMetrics: this.portfolioManager.getMetrics(),
       botMetrics: {
         uptime: this._calculateRuntime(),
-        isRunning: this.isRunning,
-        cyclesRun: this.processingStatus.cycleCount,
-        successfulCycles: this.processingStatus.successfulCycles,
-        failedCycles: this.processingStatus.failedCycles,
-        lastCycleTime: this.processingStatus.lastCycleTime 
-          ? new Date(this.processingStatus.lastCycleTime).toISOString() 
-          : null,
-        cacheStats: this.getCacheStats()
+        isRunning: this.state.isRunning,
+        cyclesRun: this.state.cycleCount,
+        successfulCycles: this.state.successfulCycles,
+        failedCycles: this.state.failedCycles,
+        lastCycleTime: this.state.lastCycleTime 
+          ? new Date(this.state.lastCycleTime).toISOString() 
+          : null
       }
     };
   }
   
   /**
-   * Obtient les statistiques de cache
-   * @returns {Object} Statistiques de cache
-   */
-  getCacheStats() {
-    return {
-      dataCache: this.dataCache.size,
-      tokenCache: this.tokenCache.size,
-      priceCache: this.priceCache.size
-    };
-  }
-  
-  /**
-   * Nettoie les caches de données périmées
-   * @private
-   */
-  cleanupDataCache() {
-    const now = Date.now();
-    
-    // Nettoyer le cache de données historiques (plus de 10 minutes)
-    for (const [key, value] of this.dataCache.entries()) {
-      if (now - value.timestamp > 10 * 60 * 1000) {
-        this.dataCache.delete(key);
-      }
-    }
-    
-    // Nettoyer le cache de prix (plus de 2 minutes)
-    for (const [key, value] of this.priceCache.entries()) {
-      if (now - value.timestamp > 2 * 60 * 1000) {
-        this.priceCache.delete(key);
-      }
-    }
-    
-    // Nettoyer le cache de tokens (plus de 30 minutes)
-    for (const [key, value] of this.tokenCache.entries()) {
-      if (now - value.timestamp > 30 * 60 * 1000) {
-        this.tokenCache.delete(key);
-      }
-    }
-    
-    this.emit('debug', `Cache cleanup: ${this.dataCache.size} historical data, ${this.priceCache.size} prices, ${this.tokenCache.size} token lists`);
-  }
-  
-  /**
-   * Exporte les logs de trading
-   * @param {string} format - Format d'exportation (json ou csv)
-   * @returns {string} Logs exportés
+   * Export trading logs
+   * @param {string} format - Export format (json or csv)
+   * @returns {string} Exported logs
    */
   exportTradingLogs(format = 'json') {
     return this.logger.exportLogs(format);
   }
   
   /**
-   * Génère un rapport console
-   * @returns {string} Rapport formaté pour la console
+   * Generate console report
+   * @returns {string} Formatted console report
    */
   generateConsoleReport() {
-    return this.visualizer.generateConsoleReport();
+    return this.logger.getFormattedReport();
   }
   
   /**
-   * Génère un rapport HTML
-   * @returns {string} Rapport HTML
-   */
-  generateHtmlReport() {
-    return this.visualizer.generateHtmlReport();
-  }
-  
-  /**
-   * Génère un rapport interactif avancé avec graphiques
-   * @returns {string} Rapport HTML interactif
-   */
-  generateInteractiveReport() {
-    return this.visualizer.generateInteractiveReport();
-  }
-  
-  /**
-   * Émet une mise à jour d'état pour les clients connectés
+   * Emit status update to connected clients
    */
   emitStatusUpdate() {
-    if (!this.isRunning) return;
+    if (!this.state.isRunning) return;
     
     const statusUpdate = {
       timestamp: new Date().toISOString(),
       botStatus: {
-        isRunning: this.isRunning,
+        isRunning: this.state.isRunning,
         uptime: this._calculateRuntime(),
-        cyclesRun: this.processingStatus.cycleCount,
-        successfulCycles: this.processingStatus.successfulCycles,
-        failedCycles: this.processingStatus.failedCycles,
-        cacheStats: this.getCacheStats()
+        cyclesRun: this.state.cycleCount,
+        successfulCycles: this.state.successfulCycles,
+        failedCycles: this.state.failedCycles
       },
       portfolioStatus: this.portfolioManager.getMetrics(),
       openPositions: this.positionManager.getOpenPositions().length
@@ -844,28 +926,25 @@ export class TradingBot extends EventEmitter {
   }
   
   /**
-   * Effectue des tâches de nettoyage périodiques
+   * Perform periodic cleanup tasks
    */
   async performCleanupTasks() {
     try {
       this.emit('info', 'Performing scheduled cleanup tasks');
       
-      // Nettoyage des anciens logs
-      const deletedFiles = await this.logger.cleanupOldLogs(90); // 90 jours
+      // Clean up old logs
+      const deletedFiles = await this.logger.cleanupOldLogs(90); // 90 days
       
       if (deletedFiles > 0) {
         this.emit('info', `Cleaned up ${deletedFiles} old log files`);
       }
       
-      // Exportation automatique des logs
+      // Automatic log export
       const exported = await this.logger.exportAndSaveLogs('json');
       
       if (exported) {
         this.emit('info', 'Successfully exported trading logs');
       }
-      
-      // Nettoyage complet des caches
-      this.cleanupDataCache();
       
       return true;
     } catch (error) {
@@ -875,21 +954,21 @@ export class TradingBot extends EventEmitter {
   }
   
   /**
-   * Active le disjoncteur en cas d'erreurs consécutives
+   * Activate circuit breaker after consecutive errors
    * @private
    */
   _activateCircuitBreaker() {
-    // Arrêter temporairement le bot
-    this.isRunning = false;
+    // Temporarily stop the bot
+    this.state.isRunning = false;
     
-    // Nettoyer les intervalles
-    for (const interval of Object.values(this.intervals)) {
+    // Clear intervals
+    Object.values(this.intervals).forEach(interval => {
       if (interval) clearInterval(interval);
-    }
+    });
     
     this.emit('warning', `Circuit breaker activated, pausing for ${this.config.errorHandling.circuitBreakerTimeout / 1000} seconds`);
     
-    // Redémarrer après le délai configuré
+    // Restart after configured timeout
     setTimeout(() => {
       this.emit('info', 'Circuit breaker timeout expired, restarting bot');
       this.start().catch(error => {
@@ -899,14 +978,14 @@ export class TradingBot extends EventEmitter {
   }
   
   /**
-   * Calcule la durée de fonctionnement du bot
-   * @returns {string} Durée formatée
+   * Calculate bot runtime
+   * @returns {string} Formatted runtime
    * @private
    */
   _calculateRuntime() {
-    if (!this.startTime) return '0s';
+    if (!this.state.startTime) return '0s';
     
-    const runtime = Date.now() - this.startTime;
+    const runtime = Date.now() - this.state.startTime;
     const seconds = Math.floor(runtime / 1000) % 60;
     const minutes = Math.floor(runtime / (1000 * 60)) % 60;
     const hours = Math.floor(runtime / (1000 * 60 * 60)) % 24;
@@ -924,10 +1003,10 @@ export class TradingBot extends EventEmitter {
   }
   
   /**
-   * Calcule le nombre d'heures entre deux dates
-   * @param {Date|string|number} start - Date de début
-   * @param {Date|string|number} end - Date de fin
-   * @returns {number} Nombre d'heures
+   * Calculate hours between two dates
+   * @param {Date|string|number} start - Start date
+   * @param {Date|string|number} end - End date
+   * @returns {number} Number of hours
    * @private
    */
   _calculateHoursBetween(start, end) {
