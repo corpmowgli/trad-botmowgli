@@ -1,7 +1,6 @@
-// server.js
+// server.js - Optimized version
 import express from 'express';
 import http from 'http';
-import { Server as SocketIOServer } from 'socket.io';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
@@ -28,8 +27,9 @@ import {
 } from './middleware/auth.js';
 import { validate, validationRules, sanitizeAllInputs } from './middleware/validation.js';
 import LogService from './services/logService.js';
+import { SocketService } from './services/socketService.js';
 
-// Import trading bot classes
+// Import trading bot class
 import { TradingBot } from './bot.js';
 import { tradingConfig } from './config/tradingConfig.js';
 
@@ -38,15 +38,6 @@ const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 const ENV = process.env.NODE_ENV || 'development';
-
-// Socket.io with CORS configuration
-const io = new SocketIOServer(server, {
-  cors: {
-    origin: ENV === 'production' ? false : '*',
-    methods: ['GET', 'POST'],
-    credentials: true
-  }
-});
 
 // Get directory paths using ESM
 const __filename = fileURLToPath(import.meta.url);
@@ -72,7 +63,7 @@ app.use(sanitizeAllInputs);
 // API rate limiting
 app.use('/api/', apiRateLimiter);
 
-// Static files middleware
+// Static files middleware with caching for production
 app.use(express.static(path.join(__dirname, 'public'), {
   maxAge: ENV === 'production' ? '1d' : 0 // Cache in production
 }));
@@ -80,6 +71,13 @@ app.use(express.static(path.join(__dirname, 'public'), {
 // Trading bot instance
 const bot = new TradingBot(tradingConfig);
 let isRunning = false;
+
+// Store bot globally for easier access
+global.bot = bot;
+global.botStatus = { isRunning };
+
+// Initialize Socket.IO service
+const socketService = new SocketService(server, { env: ENV });
 
 // Routes
 // ------------------------------------------------------------
@@ -117,10 +115,15 @@ app.get('/api/verify-auth', authenticateJWT, (req, res) => {
 // Bot status
 app.get('/api/status', authenticateJWT, (req, res) => {
   res.json({
-    isRunning: isRunning,
+    isRunning,
     config: tradingConfig,
     timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    botUptime: isRunning ? bot._calculateRuntime() : null,
+    systemInfo: {
+      memoryUsage: process.memoryUsage(),
+      cpuUsage: process.cpuUsage()
+    }
   });
 });
 
@@ -135,20 +138,35 @@ app.get('/api/performance', authenticateJWT, async (req, res) => {
   }
 });
 
-// Trades data
+// Trades data with pagination and filtering
 app.get('/api/trades', authenticateJWT, validationRules.getTrades, validate, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
     const offset = parseInt(req.query.offset) || 0;
-    const trades = bot.logger.getRecentTrades(limit, offset);
+    const token = req.query.token;
+    const startDate = req.query.startDate;
+    const endDate = req.query.endDate;
+    
+    // Apply filters if provided
+    let trades;
+    if (token) {
+      trades = bot.logger.getTradesByToken(token);
+    } else if (startDate && endDate) {
+      trades = bot.logger.getTradesByDateRange(startDate, endDate);
+    } else {
+      trades = bot.logger.getRecentTrades(limit, offset);
+    }
+    
+    // Apply pagination if not using token filter
+    const paginatedTrades = token ? trades.slice(offset, offset + limit) : trades;
     
     res.json({
-      trades,
+      trades: paginatedTrades,
       pagination: {
-        total: bot.logger.getTotalTradesCount(),
+        total: token ? trades.length : bot.logger.getTotalTradesCount(),
         limit,
         offset,
-        hasMore: (offset + trades.length) < bot.logger.getTotalTradesCount()
+        hasMore: (offset + paginatedTrades.length) < (token ? trades.length : bot.logger.getTotalTradesCount())
       }
     });
   } catch (error) {
@@ -157,17 +175,23 @@ app.get('/api/trades', authenticateJWT, validationRules.getTrades, validate, asy
   }
 });
 
-// Daily performance data
+// Daily performance data with pagination
 app.get('/api/daily-performance', authenticateJWT, validationRules.getDailyPerformance, validate, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 30;
     const offset = parseInt(req.query.offset) || 0;
-    const dailyPerformance = bot.logger.getDailyPerformance().slice(offset, offset + limit);
+    
+    // Get all daily performance and sort chronologically if requested
+    const sortByDate = req.query.sort === 'asc';
+    const allPerformance = bot.logger.getDailyPerformance(sortByDate);
+    
+    // Apply pagination
+    const dailyPerformance = allPerformance.slice(offset, offset + limit);
     
     res.json({
       data: dailyPerformance,
       pagination: {
-        total: bot.logger.getDailyPerformance().length,
+        total: allPerformance.length,
         limit,
         offset
       }
@@ -175,6 +199,29 @@ app.get('/api/daily-performance', authenticateJWT, validationRules.getDailyPerfo
   } catch (error) {
     console.error('Error getting daily performance:', error);
     res.status(500).json({ error: 'Failed to get daily performance' });
+  }
+});
+
+// Monthly performance data
+app.get('/api/monthly-performance', authenticateJWT, async (req, res) => {
+  try {
+    const monthlyPerformance = bot.logger.getMonthlyPerformance();
+    res.json({ data: monthlyPerformance });
+  } catch (error) {
+    console.error('Error getting monthly performance:', error);
+    res.status(500).json({ error: 'Failed to get monthly performance' });
+  }
+});
+
+// Token performance data
+app.get('/api/token-performance', authenticateJWT, async (req, res) => {
+  try {
+    const minTrades = parseInt(req.query.minTrades) || 0;
+    const tokenPerformance = bot.logger.getTokenPerformance(minTrades);
+    res.json({ data: tokenPerformance });
+  } catch (error) {
+    console.error('Error getting token performance:', error);
+    res.status(500).json({ error: 'Failed to get token performance' });
   }
 });
 
@@ -193,16 +240,23 @@ app.get('/api/portfolio', authenticateJWT, async (req, res) => {
 app.post('/api/start', authenticateJWT, authorizeRoles('admin'), csrfProtection, async (req, res) => {
   if (!isRunning) {
     try {
-      isRunning = true;
-      bot.start();
+      const success = await bot.start();
       
-      // Log the event
-      console.info(`Bot started by user: ${req.user.username}`);
-      
-      res.json({ status: 'Trading bot started' });
-      io.emit('bot_status_change', { isRunning: true });
+      if (success) {
+        isRunning = true;
+        global.botStatus.isRunning = true;
+        
+        // Log the event
+        console.info(`Bot started by user: ${req.user.username}`);
+        
+        // Broadcast status change using socket service
+        socketService.broadcastStatusChange(true);
+        
+        res.json({ status: 'Trading bot started' });
+      } else {
+        res.status(500).json({ error: 'Bot failed to start' });
+      }
     } catch (error) {
-      isRunning = false;
       console.error('Error starting trading bot:', error);
       res.status(500).json({ error: 'Failed to start trading bot' });
     }
@@ -216,12 +270,15 @@ app.post('/api/stop', authenticateJWT, authorizeRoles('admin'), csrfProtection, 
     try {
       const report = await bot.stop();
       isRunning = false;
+      global.botStatus.isRunning = false;
       
       // Log the event
       console.info(`Bot stopped by user: ${req.user.username}`);
       
+      // Broadcast status change using socket service
+      socketService.broadcastStatusChange(false);
+      
       res.json({ status: 'Trading bot stopped', report });
-      io.emit('bot_status_change', { isRunning: false });
     } catch (error) {
       console.error('Error stopping trading bot:', error);
       res.status(500).json({ error: 'Failed to stop trading bot' });
@@ -231,7 +288,7 @@ app.post('/api/stop', authenticateJWT, authorizeRoles('admin'), csrfProtection, 
   }
 });
 
-// Simulation
+// Simulation with custom configuration
 app.post('/api/simulation', authenticateJWT, csrfProtection, validationRules.simulation, validate, async (req, res) => {
   try {
     const { startDate, endDate, config } = req.body;
@@ -282,105 +339,72 @@ app.get('/api/export-logs', authenticateJWT, validationRules.exportLogs, validat
   }
 });
 
-// Socket.IO real-time updates
-// ------------------------------------------------------------
-io.on('connection', (socket) => {
-  console.log('New client connected', socket.id);
-  
-  // Check authentication for socket connections
-  const token = socket.handshake.auth.token;
-  if (!token) {
-    console.log('Unauthenticated socket connection attempt');
-    socket.emit('auth_error', { message: 'Authentication required' });
-    socket.disconnect();
-    return;
-  }
-  
+// Get HTML reports
+app.get('/api/reports/html', authenticateJWT, async (req, res) => {
   try {
-    // Verify token
-    jwt.verify(token, JWT_SECRET);
-    
-    // Send current bot status
-    socket.emit('bot_status', { isRunning });
-    
-    // Handle disconnection
-    socket.on('disconnect', () => {
-      console.log('Client disconnected', socket.id);
-    });
-    
-    // Custom event handlers
-    socket.on('request_update', () => {
-      broadcastUpdates(socket);
-    });
-    
+    const htmlReport = bot.generateHtmlReport();
+    res.send(htmlReport);
   } catch (error) {
-    console.error('Socket authentication error:', error);
-    socket.emit('auth_error', { message: 'Invalid authentication' });
-    socket.disconnect();
+    console.error('Error generating HTML report:', error);
+    res.status(500).json({ error: 'Failed to generate HTML report' });
   }
 });
 
-// Regular updates to connected clients
-const broadcastUpdates = async (socket = null) => {
+app.get('/api/reports/interactive', authenticateJWT, async (req, res) => {
   try {
-    if (isRunning) {
-      const report = bot.getPerformanceReport();
-      const recentTrades = bot.logger.getRecentTrades(5);
-      const updateData = { 
-        report, 
-        recentTrades, 
-        timestamp: new Date().toISOString() 
-      };
-      
-      if (socket) {
-        // Send only to the requesting socket
-        socket.emit('bot_update', updateData);
-      } else {
-        // Broadcast to all connected clients
-        io.emit('bot_update', updateData);
+    const interactiveReport = bot.generateInteractiveReport();
+    res.send(interactiveReport);
+  } catch (error) {
+    console.error('Error generating interactive report:', error);
+    res.status(500).json({ error: 'Failed to generate interactive report' });
+  }
+});
+
+// System health endpoint
+app.get('/api/health', async (req, res) => {
+  try {
+    const memory = process.memoryUsage();
+    const health = {
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+      memory: {
+        rss: Math.round(memory.rss / 1024 / 1024), // Convert to MB
+        heapTotal: Math.round(memory.heapTotal / 1024 / 1024),
+        heapUsed: Math.round(memory.heapUsed / 1024 / 1024),
+        external: Math.round(memory.external / 1024 / 1024)
+      },
+      services: {
+        bot: isRunning ? 'running' : 'stopped',
+        socket: socketService.getClientCount()
       }
-    }
+    };
+    
+    res.json(health);
   } catch (error) {
-    console.error('Error broadcasting updates:', error);
+    console.error('Error in health check:', error);
+    res.status(500).json({ status: 'error', error: error.message });
   }
-};
+});
 
-// Set interval for regular updates (every 10 seconds)
-setInterval(() => broadcastUpdates(), 10000);
+// Subscribe to bot events for real-time updates
+bot.on('trade', (trade) => {
+  // Broadcast trade via socket
+  socketService.broadcastTrade(trade);
+});
 
-// Scheduled log cleanup
-// ------------------------------------------------------------
-const scheduleLogCleanup = async () => {
-  try {
-    const logService = new LogService(tradingConfig);
-    await logService.cleanupOldLogs(90); // Clean logs older than 90 days
-    console.log('Scheduled log cleanup completed');
-  } catch (error) {
-    console.error('Error during scheduled log cleanup:', error);
+bot.on('status', (statusUpdate) => {
+  // Broadcast status update
+  socketService.broadcastUpdate({ statusUpdate });
+});
+
+// Regularly broadcast updates to connected clients (every 10 seconds if bot is running)
+setInterval(() => {
+  if (isRunning) {
+    const report = bot.getPerformanceReport();
+    socketService.broadcastUpdate({ report });
   }
-};
-
-// Schedule next cleanup at midnight
-const scheduleNextCleanup = () => {
-  const now = new Date();
-  const night = new Date(
-    now.getFullYear(),
-    now.getMonth(),
-    now.getDate() + 1, // Tomorrow
-    0, 0, 0 // Midnight
-  );
-  
-  const timeToMidnight = night.getTime() - now.getTime();
-  
-  setTimeout(() => {
-    scheduleLogCleanup();
-    // Schedule next cleanup
-    scheduleNextCleanup();
-  }, timeToMidnight);
-};
-
-// Start the scheduler
-scheduleNextCleanup();
+}, 10000);
 
 // Error handling middleware
 // ------------------------------------------------------------
@@ -441,6 +465,11 @@ async function gracefulShutdown() {
     } catch (error) {
       console.error('Error stopping trading bot:', error);
     }
+  }
+  
+  // Clean up socket service
+  if (socketService && socketService.cleanup) {
+    socketService.cleanup();
   }
   
   // Close server connections
